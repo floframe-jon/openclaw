@@ -4988,11 +4988,16 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
     { repository: "openclaw/openclaw", ref: "refs/heads/main", expected: true },
     { repository: "openclaw/openclaw", ref: "refs/heads/feature", expected: false },
     { repository: "fork/openclaw", ref: "refs/heads/main", expected: false },
+    {
+      repository: "floframe-jon/openclaw",
+      ref: "refs/heads/maintenance/2026.9.5",
+      expected: false,
+    },
   ])(
     "gates only canonical main pushes admitted by CI ($repository $ref)",
     ({ repository, ref, expected }) => {
       const push = readCiWorkflow().on.push;
-      expect(push.branches).toEqual(["main"]);
+      expect(push.branches).toEqual(["main", "maintenance/2026.9.5"]);
       expect(push).not.toHaveProperty("paths");
       expect(push["paths-ignore"]).toEqual(["**/*.md", "docs/**"]);
       const result = runCiManifestFixture({
