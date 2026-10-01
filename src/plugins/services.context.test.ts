@@ -7,6 +7,7 @@ import {
 import { createSyntheticPluginRuntimeClient } from "../gateway/server-plugin-runtime-client.js";
 import { createGatewayRequestContext } from "../gateway/server-request-context.js";
 import { makeContextParams } from "../gateway/server-request-context.test-support.js";
+import { PluginInstance } from "./plugin-instance.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import { bindPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import {
@@ -17,6 +18,71 @@ import {
 } from "./runtime/gateway-request-scope.js";
 import { createPluginRuntime } from "./runtime/index.js";
 import { startPluginServices } from "./services.js";
+import { createRegistry } from "./services.test-support.js";
+import { createPluginRecord } from "./status.test-helpers.js";
+
+it.each(["projection", "unbound"] as const)(
+  "captures the %s service owner's Gateway without borrowing a caller",
+  async (kind) => {
+    let wake: ReturnType<typeof AsyncLocalStorage.snapshot> | undefined;
+    let startupScope: ReturnType<typeof getPluginRuntimeGatewayRequestScope>;
+    const registry = createRegistry([
+      {
+        id: "queue",
+        start() {
+          startupScope = getPluginRuntimeGatewayRequestScope();
+          wake = AsyncLocalStorage.snapshot();
+        },
+      },
+    ]);
+    const record = createPluginRecord({ id: "plugin:test" });
+    registry.plugins.push(record);
+    const instance = new PluginInstance(record.id, { record, registry });
+    const runtime = createPluginRuntime();
+    bindPluginRegistryRuntime(registry, runtime);
+    const ownedContext = createGatewayRequestContext(makeContextParams());
+    const callerContext = createGatewayRequestContext(makeContextParams());
+    const resolveOwnedContext = () => ownedContext;
+    if (kind === "projection") {
+      bindGatewayContextResolver(runtime, resolveOwnedContext);
+    }
+    const caller = {
+      context: callerContext,
+      client: createSyntheticPluginRuntimeClient({ scopes: ["operator.read"] }),
+      isWebchatConnect: () => true,
+      resolveGatewayContext: () => callerContext,
+    };
+    const handle = await withPluginRuntimeGatewayRequestScope(caller, () =>
+      startPluginServices({
+        registry: kind === "projection" ? { ...registry } : registry,
+        config: {},
+      }),
+    );
+    try {
+      expect(startupScope?.pluginId).toBe(record.id);
+      expect(startupScope?.client).toBeUndefined();
+      expect(startupScope?.context).toBeUndefined();
+      expect(startupScope?.isWebchatConnect(undefined)).toBe(false);
+      expect(startupScope?.resolveGatewayContext).toBe(
+        kind === "projection" ? resolveOwnedContext : undefined,
+      );
+      expect(wake).toBeDefined();
+      await withPluginRuntimeGatewayRequestScope(caller, async () => {
+        await wake?.(async () => {
+          await Promise.resolve();
+          expect(getPluginRuntimeGatewayRequestScope()).toBe(startupScope);
+          expect(getInProcessGatewayRequestContext()).toBe(
+            kind === "projection" ? ownedContext : undefined,
+          );
+        });
+        expect(getPluginRuntimeGatewayRequestScope()).toBe(caller);
+      });
+    } finally {
+      await handle.stop();
+      await instance.dispose();
+    }
+  },
+);
 
 it("starts and reloads background services outside the RPC and tool authority", async () => {
   const runtime = createPluginRuntime();

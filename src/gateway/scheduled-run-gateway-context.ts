@@ -57,9 +57,6 @@ export function createScheduledGatewayRunner(
     await withoutGatewayToolCallerIdentity(() =>
       runWithSpawnBroker(spawnBroker, async () => {
         const runWithWorkers = () => runWithReadOnlyWorkers(run);
-        if (!resolveGatewayContext) {
-          return await runWithWorkers();
-        }
         return await withPluginRuntimeGatewayContextResolver(
           resolveGatewayContext,
           runWithWorkers,
