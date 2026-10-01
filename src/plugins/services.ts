@@ -1,5 +1,6 @@
 import { STATE_DIR } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { runWithoutOperatorToolGatewayAuthority } from "../gateway/operator-tool-gateway-authority.js";
 import { getGatewayProcessInstanceId } from "../gateway/process-instance.js";
 import type { GatewayPluginEventBroadcastFn } from "../gateway/server-broadcast-types.js";
 import {
@@ -29,8 +30,13 @@ import { getPluginInstance, runPluginCleanup } from "./plugin-instance-scope.js"
 import type { PluginInstanceConsumer } from "./plugin-instance.types.js";
 import { resolvePluginReturnPromise } from "./plugin-return-value.js";
 import { getPluginRecordRegistry } from "./registry-lifecycle.js";
+import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import type { PluginServiceRegistration } from "./registry-types.js";
 import type { PluginRegistry } from "./registry.js";
+import {
+  getGatewayContextResolver,
+  withPluginRuntimeGatewayContextResolver,
+} from "./runtime/gateway-request-scope.js";
 import { createPluginServiceCronGetter, type PluginServiceCronHost } from "./service-cron.js";
 import { createPluginServiceHealthReporter } from "./service-health.js";
 import { encodeStartupTraceSegment } from "./startup-trace-segment.js";
@@ -442,6 +448,9 @@ async function startPreparedPluginServices({
     const { service, id } = entry;
     const record = registry.plugins.find((plugin) => plugin.id === entry.pluginId);
     const instance = record && getPluginInstance(record);
+    const serviceRegistry = record ? getPluginRecordRegistry(registry, record) : registry;
+    const runtime = getPluginRegistryRuntime(serviceRegistry);
+    const resolveGatewayContext = runtime && getGatewayContextResolver(runtime.subagent);
     // Native service receivers retain their brands; registration owns their invocation scope.
     const runServiceCleanup = <T>(run: () => T): T =>
       instance ? instance.runCleanup(run) : runPluginCleanup(service, run);
@@ -613,11 +622,24 @@ async function startPreparedPluginServices({
         try {
           ownedService.startupConsumer = instance?.retainConsumer();
           const start = () => service.start(serviceContext);
-          await withPluginHttpRouteRegistry(
-            registry,
-            () =>
-              ownedService.startupConsumer ? ownedService.startupConsumer.run(start) : start(),
-            lease,
+          // Service startup owns background work, even when an RPC initiated replacement.
+          // Detach request facts before the real consumer reattaches plugin identity.
+          // Keep the runtime's captured resolver, including its lifetime fence; unbound
+          // services must never borrow the caller's Gateway.
+          await runWithoutOperatorToolGatewayAuthority(() =>
+            withPluginRuntimeGatewayContextResolver(
+              resolveGatewayContext,
+              () =>
+                withPluginHttpRouteRegistry(
+                  registry,
+                  () =>
+                    ownedService.startupConsumer
+                      ? ownedService.startupConsumer.run(start)
+                      : start(),
+                  lease,
+                ),
+              { inheritRequestScope: false },
+            ),
           );
         } finally {
           // Failed-start rollback waits on raw work, never on the rollback that follows it.
