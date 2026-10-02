@@ -492,21 +492,21 @@ async function startPreparedPluginServices({
     });
     const { health, revoke } = createPluginServiceHealthReporter(entry);
     lease.retain(revoke);
-    const runtime = getPluginRegistryRuntime(registry);
-    const runServiceStart = createScheduledGatewayRunner(
-      runtime ? getGatewayContextResolver(runtime) : undefined,
-    );
+    const serviceRegistry = record ? getPluginRecordRegistry(registry, record) : registry;
+    const runtime = getPluginRegistryRuntime(serviceRegistry);
+    const resolveGatewayContext = runtime ? getGatewayContextResolver(runtime) : undefined;
+    const runServiceStart = createScheduledGatewayRunner(resolveGatewayContext);
     const getCron = getCronService
       ? createPluginServiceCronGetter({
           getCron: getCronService,
           lease,
           isStopping: () => ownedService.owner.closed || ownedService.stopRequested,
-          resolveGatewayContext: runtime ? getGatewayContextResolver(runtime) : undefined,
+          resolveGatewayContext,
         })
       : undefined;
     const nodeInvoker = record
       ? createPluginServiceNodeInvoker({
-          registry,
+          registry: serviceRegistry,
           record,
           lease,
           isStopping: () => ownedService.owner.closed || ownedService.stopRequested,

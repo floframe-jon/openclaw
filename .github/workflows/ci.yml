@@ -6363,6 +6363,7 @@ jobs:
       - docker-seed-e2e
       - pr-fail-fast
       - ci-gate
+      - published-driver-update
     if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && startsWith(inputs.dispatch_id, 'full-release-validation-') }}
     permissions:
       contents: read

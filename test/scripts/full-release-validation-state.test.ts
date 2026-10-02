@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, assert, describe, expect, it } from "vitest";
+import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildFullReleaseCandidateBinding,
   buildFullReleaseCandidateRequest,
@@ -60,6 +60,14 @@ const SHA = "a".repeat(40);
 const TARGET_SHA = "b".repeat(40);
 const TRUSTED_MAIN = { fullRef: "refs/heads/main", ref: "main", sha: SHA };
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+// Synthetic run provenance belongs to the fixture, including when CI runs in a fork.
+beforeEach(() => {
+  vi.stubEnv("GITHUB_REPOSITORY", "openclaw/openclaw");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 function collectorEnv(overrides: NodeJS.ProcessEnv) {
   return {

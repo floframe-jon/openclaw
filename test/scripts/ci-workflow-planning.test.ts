@@ -10864,10 +10864,11 @@ describe("ci workflow guards", () => {
     ]);
   });
 
-  it("provisions ripgrep for real filesystem contract selections", () => {
+  it("provisions ripgrep for real filesystem and database inventory contract selections", () => {
     const contract = "src/agents/filesystem-tools-output-contract.test.ts";
     const nativeTools = "src/agents/sessions/tools/index.test.ts";
     const bytePaths = "src/agents/sessions/tools/grep.byte-path.test.ts";
+    const databaseRatchet = "test/scripts/check-database-worker-ratchet.test.ts";
     const unrelated = "src/agents/run-wait.test.ts";
     const selections = [
       { targets: [contract] },
@@ -10886,6 +10887,11 @@ describe("ci workflow guards", () => {
       { groups: [{ shard_name: "agentic-agents-support", includePatterns: [nativeTools] }] },
       { groups: [{ shard_name: "agentic-agents-core-runtime", includePatterns: [unrelated] }] },
       { groups: [{ shard_name: "agentic-agents-core-runtime" }] },
+      { targets: [databaseRatchet] },
+      { includePatterns: [databaseRatchet] },
+      { includePatterns: ["test/scripts/check-database-*.test.ts"] },
+      { groups: [{ shard_name: "core-tooling", targets: [databaseRatchet] }] },
+      { groups: [{ shard_name: "core-tooling", includePatterns: [databaseRatchet] }] },
     ];
     const result = runCiManifestFixture({
       bundledPlanner: true,
@@ -10922,6 +10928,11 @@ describe("ci workflow guards", () => {
       true,
       true,
       false,
+      true,
+      true,
+      true,
+      true,
+      true,
       true,
     ]);
   });
