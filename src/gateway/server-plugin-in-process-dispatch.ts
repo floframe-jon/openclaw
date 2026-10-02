@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { AgentWaitParams } from "../../packages/gateway-protocol/src/index.js";
 import type { SubagentCompletionToolHandoffRegistration } from "../agents/subagents/announce/subagent-announce-handoff.js";
 import { getActivePluginRegistry } from "../plugins/runtime.js";
@@ -15,6 +14,7 @@ import {
 } from "./in-process-subagent-resume.js";
 import { authorizeGatewaySessionCreation } from "./operator-role-policy.js";
 import { ADMIN_SCOPE, WRITE_SCOPE } from "./operator-scopes.js";
+import { operatorToolGatewayAuthority } from "./operator-tool-gateway-authority.js";
 import {
   dispatchGatewayRequestInProcessRaw,
   type GatewayMethodDispatchResponse,
@@ -40,29 +40,7 @@ import {
   registerSubagentCompletionToolHandoff,
 } from "./subagent-completion-tool-handoff.js";
 
-type OperatorToolGatewayAuthority = {
-  authenticatedUserProfile: NonNullable<
-    NonNullable<GatewayRequestOptions["client"]>["authenticatedUserProfile"]
-  >;
-  scopes: readonly string[];
-  operatorRoleActor?: GatewayOperatorRoleActor;
-  signal: AbortSignal;
-};
-
-const operatorToolGatewayAuthority = new AsyncLocalStorage<OperatorToolGatewayAuthority>();
-
-/** Retains operator attribution and authority only for the awaited tool invocation. */
-export async function withOperatorToolGatewayAuthority<T>(
-  authority: Omit<OperatorToolGatewayAuthority, "signal">,
-  run: () => Promise<T>,
-): Promise<T> {
-  const lifetime = new AbortController();
-  try {
-    return await operatorToolGatewayAuthority.run({ ...authority, signal: lifetime.signal }, run);
-  } finally {
-    lifetime.abort(new Error("operator tool invocation authority expired"));
-  }
-}
+export { withOperatorToolGatewayAuthority } from "./operator-tool-gateway-authority.js";
 
 /** Transfer bounded cleanup without retaining the finished operator invocation. */
 export function runWithOperatorToolGatewayCleanupContext<T>(run: () => T): T {

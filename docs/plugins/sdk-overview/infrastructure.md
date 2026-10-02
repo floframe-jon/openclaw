@@ -40,6 +40,18 @@ background services, plus the SDK helpers those surfaces depend on. Part of the
 
 Gateway methods default to `profileAccess: "required"`, so authenticated-profile verification fails closed before plugin dispatch. Set `profileAccess: "independent"` only for an audited method that neither reads nor mutates durable user or session state. Operator scope remains a separate authorization requirement.
 
+### Background service ownership
+
+The host starts registered services with their plugin identity and captured Gateway
+binding, without the request client or request context that initiated startup.
+Cold startup and selected plugin reload use the same service scope. Ordinary
+Gateway method and tool invocations retain their request authority.
+
+Capture background callback context during `service.start`, rather than during a
+later client request. The service still owns cancellation and drainage of its
+callbacks in `service.stop`; capturing startup context does not extend a retired
+plugin or Gateway lifetime or authorize callbacks after service shutdown.
+
 ### File-watch capacity errors
 
 `getFileWatchCapacityCode(error)` from `openclaw/plugin-sdk/file-access-runtime`

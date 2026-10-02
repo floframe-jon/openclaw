@@ -845,7 +845,10 @@ exec "$(dirname "$0")/healthy-ps" "$@"
         expect(exhausted.recoveryError).toContain(JSON.stringify(entry));
         expect(await processState(entry.pid)).toMatch(/^T/u);
       }
-      await expect(quiescence.resume()).rejects.toThrow(exhausted.recoveryError);
+      // The lease retains exact ps identities; the public workspace error collapses whitespace.
+      await expect(quiescence.resume()).rejects.toThrow(
+        exhausted.recoveryError.replace(/\s+/gu, " ").trim(),
+      );
       await fs.unlink(stallPath);
       await quiescence.resume();
       await expect(fs.stat(leaseFile)).rejects.toThrow();

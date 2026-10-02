@@ -55,7 +55,7 @@ on:
         default: ""
         type: string
   push:
-    branches: [main]
+    branches: [main, maintenance/2026.9.5]
     paths-ignore:
       - "**/*.md"
       - "docs/**"

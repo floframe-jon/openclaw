@@ -22,6 +22,17 @@ export type InstanceBindingProbeResult = {
   sessionsId: number;
   placementId: number;
   reloadSettled?: boolean;
+  requestScope?: ServiceScopeProbeResult;
+  serviceScope?: ServiceScopeProbeResult;
+};
+
+type ServiceScopeProbeResult = {
+  pluginId?: string;
+  registryId?: number;
+  sessionsId?: number;
+  hasClient: boolean;
+  hasContext: boolean;
+  isWebchat: boolean;
 };
 
 export const CHANNEL_BINDING_IDS = ["binding-first", "binding-second"] as const;
@@ -52,6 +63,12 @@ export type InstanceBindingProbeCoordinator = {
   onServiceStop?: () => void;
   serviceStopCompletion: ReturnType<typeof createDeferred<void>>;
   serviceStopFailure?: "rejection" | "timeout";
+  serviceScopeProbe?: {
+    read: () => ServiceScopeProbeResult;
+    starts: Array<{ registryId: number; scope: ServiceScopeProbeResult }>;
+    wakes: Map<number, () => ServiceScopeProbeResult>;
+    stops: number[];
+  };
   channelProof?: ChannelBindingProof;
   channelIds?: readonly string[];
   channelStops?: Array<Pick<ChannelBindingMonitor, "channelId" | "runtimeId" | "abortSignal">>;
@@ -182,14 +199,27 @@ export async function writeInstanceBindingProbePlugin(
         coordinator.onLifecycleEvent({ registryId, port: context.port, kind: "stop" });
       });
     }
-    if (coordinator.serviceStopFailure) {
+    if (coordinator.serviceStopFailure || coordinator.serviceScopeProbe) {
+      let stopped = false;
       api.registerService({
         id: "instance-binding-service",
-        start() {
+        async start() {
           coordinator.serviceStarts += 1;
+          const probe = coordinator.serviceScopeProbe;
+          if (probe) {
+            await Promise.resolve();
+            probe.starts.push({ registryId, scope: probe.read() });
+            const snapshot = require("node:async_hooks").AsyncLocalStorage.snapshot();
+            probe.wakes.set(registryId, () => {
+              if (stopped) throw new Error("service stopped");
+              return snapshot(() => probe.read());
+            });
+          }
         },
         stop() {
           coordinator.serviceStops += 1;
+          stopped = true;
+          coordinator.serviceScopeProbe?.stops.push(registryId);
           coordinator.onServiceStop?.();
           if (coordinator.serviceStopFailure === "rejection") {
             return Promise.reject(new Error("instance-binding service cleanup rejected"));
@@ -206,6 +236,10 @@ export async function writeInstanceBindingProbePlugin(
         sessionsId: coordinator.identify(context.sessionCompanion),
         placementId: coordinator.identify(context.workerSessionPlacementService),
         ...(reportReloadSettlement ? { reloadSettled: context.isConfigReloadSettled() } : {}),
+        ...(coordinator.serviceScopeProbe ? {
+          requestScope: coordinator.serviceScopeProbe.read(),
+          serviceScope: coordinator.serviceScopeProbe.wakes.get(registryId)?.(),
+        } : {}),
       });
     }, { scope: "operator.read" });
   },
