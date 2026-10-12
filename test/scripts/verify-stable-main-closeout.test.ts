@@ -17,6 +17,7 @@ import {
 } from "../../scripts/lib/stable-publish-recovery.mjs";
 import { verifyStableMainCloseout } from "../../scripts/lib/stable-release-closeout.mjs";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { runWithdrawnCloseoutFixture } from "./verify-stable-main-closeout.test-support.js";
 
 const linuxTempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -778,11 +779,7 @@ process.stdout.write(JSON.stringify([
       outputPath,
     ];
     const run = (lookups: "allowed" | "forbidden", ...extra: string[]) =>
-      spawnSync(process.execPath, ["scripts/verify-stable-main-closeout.mjs", ...args, ...extra], {
-        cwd: path.resolve("."),
-        encoding: "utf8",
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, WITHDRAWAL_LOOKUPS: lookups },
-      });
+      runWithdrawnCloseoutFixture([...args, ...extra], { bin, lookups });
 
     const initial = run("allowed");
     expect(initial.status, initial.stderr).toBe(0);

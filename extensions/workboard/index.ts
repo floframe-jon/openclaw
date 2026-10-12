@@ -25,6 +25,15 @@ export default definePluginEntry({
   register(api) {
     const store = WorkboardStore.openSqlite(
       resolveWorkboardSqliteWorkerModuleUrl(api.runtimeSource),
+      {
+        verifyCheckout: async (input) => {
+          const worktrees = api.runtime.worktrees;
+          if (!worktrees.verifyCheckout) {
+            throw new Error("exact review completion requires native checkout verification");
+          }
+          return await worktrees.verifyCheckout(input);
+        },
+      },
     );
     const resourceServices: Array<{ stop(): void | Promise<void> }> = [];
     registerWorkboardStoreLifecycle(api, store, async () => {

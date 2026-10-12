@@ -40,7 +40,6 @@ import {
   type WorkboardTemplateId,
   type WorkboardWorkerLog,
   type WorkboardWorkerProtocol,
-  type WorkboardWorkspace,
 } from "@openclaw/workboard-contract";
 import {
   isRecord,
@@ -68,7 +67,17 @@ import type {
   WorkboardNotificationSubscribeInput,
   WorkboardProofInput,
 } from "./store-inputs.js";
-import { isAbsoluteWorkspacePath } from "./workspace-path.js";
+import {
+  normalizeBoundedString,
+  normalizeEnumValue,
+  normalizeTimestamp,
+} from "./store-normalization-values.js";
+import {
+  normalizeWorkspace,
+  normalizeSourceBinding,
+  normalizeReviewEvidence,
+} from "./store-source-normalizers.js";
+export { normalizeBoundedString, normalizeTimestamp } from "./store-normalization-values.js";
 
 export function normalizeBoardId(value: unknown, fallback?: string): string | undefined {
   const raw = normalizeBoundedString(value, fallback, 80, "board id");
@@ -266,24 +275,6 @@ export function normalizeNotes(value: unknown): string | undefined {
   return notes;
 }
 
-export function normalizeBoundedString(
-  value: unknown,
-  fallback: string | undefined,
-  maxLength: number,
-  fieldName: string,
-): string | undefined {
-  const normalized = normalizeOptionalString(value);
-  if (!normalized) {
-    return fallback;
-  }
-  if (normalized.length > maxLength) {
-    throw new Error(
-      `${fieldName} must be ${maxLength} characters or fewer (got ${normalized.length}).`,
-    );
-  }
-  return normalized;
-}
-
 export function capText(value: string | undefined, max: number): string | undefined {
   if (!value) {
     return undefined;
@@ -372,56 +363,6 @@ function normalizePositiveInteger(value: unknown, fieldName: string): number | u
   return Math.max(1, Math.trunc(value));
 }
 
-function normalizeWorkspace(
-  value: unknown,
-  fallback?: WorkboardWorkspace,
-): WorkboardWorkspace | undefined {
-  if (!isRecord(value)) {
-    return fallback;
-  }
-  const record = value;
-  const kind =
-    record.kind === "scratch" || record.kind === "dir" || record.kind === "worktree"
-      ? record.kind
-      : fallback?.kind;
-  if (!kind) {
-    throw new Error("workspace kind must be scratch, dir, or worktree.");
-  }
-  const workspacePath = normalizeBoundedString(record.path, fallback?.path, 2000, "workspace path");
-  if (kind === "dir" && (!workspacePath || !isAbsoluteWorkspacePath(workspacePath))) {
-    throw new Error("dir workspace path must be absolute.");
-  }
-  const workspaceFallback = workspacePath === fallback?.path ? fallback : undefined;
-  const branch = normalizeBoundedString(
-    record.branch,
-    workspaceFallback?.branch,
-    160,
-    "workspace branch",
-  );
-  const sourcePath = normalizeBoundedString(
-    record.sourcePath,
-    workspaceFallback?.sourcePath,
-    2000,
-    "workspace source path",
-  );
-  if (sourcePath && !isAbsoluteWorkspacePath(sourcePath)) {
-    throw new Error("workspace source path must be absolute.");
-  }
-  const sourceBranch = normalizeBoundedString(
-    record.sourceBranch,
-    workspaceFallback?.sourceBranch,
-    160,
-    "workspace source branch",
-  );
-  return {
-    kind,
-    ...(workspacePath ? { path: workspacePath } : {}),
-    ...(branch ? { branch } : {}),
-    ...(kind === "worktree" && sourcePath ? { sourcePath } : {}),
-    ...(kind === "worktree" && sourceBranch ? { sourceBranch } : {}),
-  };
-}
-
 export function normalizeAutomation(
   value: unknown,
   fallback: WorkboardAutomation = {},
@@ -474,6 +415,11 @@ export function normalizeAutomation(
   const launch = normalizeLaunchState(
     options.allowLaunchState && Object.hasOwn(record, "launch") ? record.launch : fallback.launch,
   );
+  const reviewEvidence = normalizeReviewEvidence(
+    options.allowLaunchState
+      ? (record.reviewEvidence ?? fallback.reviewEvidence)
+      : fallback.reviewEvidence,
+  );
   const next = removeUndefinedAutomationFields({
     ...(tenant ? { tenant } : {}),
     ...(boardId ? { boardId } : {}),
@@ -490,6 +436,7 @@ export function normalizeAutomation(
     ...(dispatchCount ? { dispatchCount } : {}),
     ...(lastDispatchAt ? { lastDispatchAt } : {}),
     ...(launch ? { launch } : {}),
+    ...(reviewEvidence.length ? { reviewEvidence } : {}),
   });
   return Object.keys(next).length ? next : undefined;
 }
@@ -510,7 +457,21 @@ function normalizeLaunchState(value: unknown): WorkboardLaunchState | undefined 
   if (!requestedSessionKey || !provisionalRunId || preparedAt === undefined) {
     return undefined;
   }
-  const identity = { requestedSessionKey, provisionalRunId, preparedAt };
+  const identity = {
+    requestedSessionKey,
+    provisionalRunId,
+    preparedAt,
+    ...(isRecord(value.source) ? { source: normalizeSourceBinding(value.source) } : {}),
+    ...(Array.isArray(value.previousProofIds)
+      ? {
+          previousProofIds: normalizeStringList(
+            value.previousProofIds,
+            "launch previous proofs",
+            120,
+          ).slice(-MAX_CARD_PROOF),
+        }
+      : {}),
+  };
   if (value.phase === "prepared") {
     return { phase: "prepared", ...identity };
   }
@@ -549,26 +510,12 @@ export function deriveChildIdempotencyKey(
   return key.length <= 160 ? key : undefined;
 }
 
-function normalizeEnumValue<T extends string, TFallback extends T | undefined>(
-  value: unknown,
-  allowed: readonly T[],
-  fallback: TFallback,
-): T | TFallback {
-  return typeof value === "string" && allowed.includes(value as T) ? (value as T) : fallback;
-}
-
 export function normalizeLinkType(value: unknown, fallback: WorkboardLinkType): WorkboardLinkType {
   return normalizeEnumValue(value, WORKBOARD_LINK_TYPES, fallback);
 }
 
 export function normalizeTemplateId(value: unknown): WorkboardTemplateId | undefined {
   return normalizeEnumValue(value, WORKBOARD_TEMPLATE_IDS, undefined);
-}
-
-export function normalizeTimestamp(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.max(0, Math.trunc(value))
-    : fallback;
 }
 
 function normalizeEvent(value: unknown): WorkboardEvent | null {
@@ -1180,6 +1127,7 @@ export function normalizeExecution(value: unknown): WorkboardExecution | undefin
     ...(model ? { model } : {}),
     ...(sessionKey ? { sessionKey } : {}),
     ...(runId ? { runId } : {}),
+    ...(isRecord(record.source) ? { source: normalizeSourceBinding(record.source) } : {}),
   };
 }
 

@@ -528,3 +528,37 @@ owner.
 - [Manage plugins](/plugins/manage-plugins)
 - [Sessions](/concepts/session)
 - [Managed worktrees](/concepts/managed-worktrees)
+
+## Exact source reviews
+
+Ordinary workspaces resume retained commits, edits, and snapshots. Changing
+`branch` or `sourceBranch` does not reset a retained managed checkout.
+
+For an exact source review, provide both `workspace.repoRoot` (the absolute
+canonical repository) and `workspace.checkoutCommit` (a full immutable Git commit
+ID). Branch names and abbreviated IDs are rejected as exact candidates. These
+fields work with `kind: "worktree"` and `kind: "dir"`; restricted access still
+applies to both the checkout and repository. The exact path must be the checkout
+root.
+
+The native dispatcher verifies the repository, actual HEAD, and clean source
+after materialization and setup, and immediately before launch. The persisted
+launch binds that source to the attempt; completion verifies it again with the
+current claim token before accepting evidence. Lifecycle exit alone does not
+complete an exact review. Reconcile an active attempt through native lifecycle
+operations before changing its source binding.
+
+Tracked/index changes and untracked files invalidate exact source, except
+untracked setup/cache outputs declared by the checkout's `.gitignore`. Global
+excludes and `.git/info/exclude` do not exempt review source. A reviewer making a
+source fix must deliver it as a new candidate through the ordinary review and CI
+acceptance path.
+
+On a mismatch, the retained checkout or snapshot is preserved and the affected
+review is held. Resolve the full candidate in the intended repository, create a
+separate native managed checkout with an unused name and `checkoutCommit`, and
+bind the same reconciled card to that path as `kind: "dir"` with `repoRoot` and
+`checkoutCommit`. Use a separate manual/session owner for the recovery checkout:
+changing only the name with the same card owner still selects its retained
+checkout. Verify the assigned worker cwd and actual commit before accepting the
+review. Keep exact-candidate and merge CI gates in the existing planner.

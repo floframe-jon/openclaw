@@ -49,6 +49,8 @@ type PluginManagedWorktree = {
   id: string;
   path: string;
   branch: string;
+  /** Release only this exact preparation's native run lease. */
+  releasePreparation?: () => Promise<void>;
 };
 
 type SubagentRunResult = {
@@ -197,10 +199,25 @@ export type PluginRuntime = PluginRuntimeCore & {
   worktrees: {
     resolveCheckoutRoot: (params: { path: string }) => Promise<string | undefined>;
     hasSelfContainedCheckoutMetadata?: (params: { path: string }) => Promise<boolean>;
+    /** Verify an immutable candidate and clean source through the native worktree owner. */
+    verifyCheckout?: (params: {
+      path: string;
+      repoRoot: string;
+      checkoutCommit: string;
+      commitGuard?: () => void;
+    }) => Promise<{
+      path: string;
+      repoRoot: string;
+      commonDir: string;
+      repoFingerprint: string;
+      headCommit: string;
+    }>;
     create: (params: {
       repoRoot: string;
       name: string;
       baseRef?: string;
+      checkoutCommit?: string;
+      requireExactSource?: boolean;
       ownerKind: "workboard";
       ownerId: string;
       commitGuard?: () => void;

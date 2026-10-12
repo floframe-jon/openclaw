@@ -7,27 +7,22 @@ import { resolveStateDir } from "../../config/paths.js";
 import { isMissingPathError, formatErrorMessage } from "../../infra/errors.js";
 import { startGitOperationTiming } from "../../infra/git-operation-timing.js";
 import { runGitReadOperation } from "../../infra/git-read-cache.js";
-import { runGitWorkerOperation } from "../../infra/git-worker.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { createCrustaceanSlug } from "../session-slug.js";
 import { withWorktreeAllocationLease, type WorktreeAllocationGuard } from "./allocation.js";
 import { resolveWorktreeBase } from "./base-ref.js";
-import {
-  directorySizeBytes,
-  estimateWorktreeGitBytes,
-  requireWorktreeDiskSpace,
-  WORKTREE_SETUP_HEADROOM_BYTES,
-} from "./capacity.js";
+import { requireWorktreeDiskSpace } from "./capacity.js";
 import { inspectManagedWorktreeCheckout } from "./checkout-inspection.js";
 import { withManagedWorktreeGit } from "./checkout-policy.js";
-import { resolveWorktreeSourceProfile } from "./checkout-profiles.js";
-import {
-  addManagedWorktree,
-  collectWorktreeTemplates,
-  WORKTREE_TEMPLATE_DIRECTORY,
-} from "./checkout.js";
+import { collectWorktreeTemplates, WORKTREE_TEMPLATE_DIRECTORY } from "./checkout.js";
 import { ensureEmptyWorktreeSource, removeUnusedEmptyWorktreeSource } from "./empty-source.js";
 import { WorktreeRepositoryError } from "./errors.js";
+import {
+  assertCheckoutCommit,
+  verifyWorktreeCheckout,
+  verifyWorktreeSnapshotSource,
+  type VerifyWorktreeCheckoutParams,
+} from "./exact-source.js";
 import { enforceWorktreeCleanupLimits } from "./gc-limits.js";
 import { WorktreeGcProgress } from "./gc-progress.js";
 import { autoRemovalProtectionReason } from "./gc-protection.js";
@@ -83,11 +78,12 @@ import {
 } from "./run-lease.js";
 import { reconcileListedWorktrees } from "./service-list.js";
 import {
-  canResetFailedWorktreeAdd,
+  materializeRepositoryWorktree,
+  type MaterializedRepositoryWorktree,
+} from "./service-materialization.js";
+import {
   cleanupFailedCreate,
   findWorktreeByName,
-  generateName,
-  resetFailedWorktreeAdd,
   resolveRepository,
   resolveRepositoryFromRealPath,
   runSetupScript,
@@ -131,6 +127,7 @@ export const SNAPSHOT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // Snapshot refs 
 export const WORKTREE_GC_INTERVAL_MS = 60 * 60 * 1000;
 
 export { WorktreeRepositoryError } from "./errors.js";
+export { WorktreeSourceMismatchError } from "./exact-source.js";
 const log = createSubsystemLogger("agents/worktrees");
 
 type ServiceOptions = {
@@ -170,16 +167,6 @@ export function resolveWorktreeCleanupLimits(): WorktreeCleanupLimits {
   return { maxCount: WORKTREE_CLEANUP_TARGET };
 }
 
-type MaterializedRepositoryWorktree = {
-  name: string;
-  worktreePath: string;
-  branch: string;
-  recordBase: string;
-  provisionedBytes: number;
-  setupBytes: number;
-  runRepositorySetup: boolean;
-};
-
 export class ManagedWorktreeService {
   private readonly env: NodeJS.ProcessEnv;
   private readonly now: () => number;
@@ -191,15 +178,6 @@ export class ManagedWorktreeService {
     this.getConfig = options.getConfig;
   }
 
-  private async worktreesRoot(): Promise<string> {
-    const root =
-      this.getConfig?.().worktreeRoot ?? path.join(resolveStateDir(this.env), "worktrees");
-    await fs.mkdir(root, { recursive: true });
-    // Git canonicalizes paths in `git worktree list`; minting below the real root keeps
-    // lock-state and adoption comparisons aligned when the state path traverses symlinks.
-    return await fs.realpath(root);
-  }
-
   async create(params: CreateManagedWorktreeParams): Promise<ManagedWorktreeRecord> {
     return (await this.createWithOutcome(params)).record;
   }
@@ -209,11 +187,27 @@ export class ManagedWorktreeService {
   ): Promise<ManagedWorktreeCreationOutcome> {
     params.signal?.throwIfAborted();
     const repository = await resolveRepository(params.repoRoot);
+    if (params.requireExactSource) {
+      if (!params.checkoutCommit) {
+        throw new Error("Exact source creation requires checkoutCommit");
+      }
+      assertCheckoutCommit(params.checkoutCommit);
+      await resolveWorktreeBase(
+        repository.repoRoot,
+        params.checkoutCommit,
+        params.signal,
+        params.commitGuard,
+      );
+    }
     return await this.createWithAllocation(
       params,
       async (guard, publication) =>
         await this.createForOwner({ ...params, ...guard }, repository, publication),
     );
+  }
+
+  async verifyCheckout(params: VerifyWorktreeCheckoutParams) {
+    return await verifyWorktreeCheckout(params);
   }
 
   async createEmpty(params: CreateEmptyManagedWorktreeParams): Promise<ManagedWorktreeRecord> {
@@ -282,6 +276,15 @@ export class ManagedWorktreeService {
       }
       if (existing && (await worktreePathExists(existing.path))) {
         return await withWorktreeSource(params, async (current) => {
+          if (current.requireExactSource && current.checkoutCommit) {
+            await this.verifyCheckout({
+              path: existing.path,
+              repoRoot: repository.repoRoot,
+              checkoutCommit: current.checkoutCommit,
+              signal: current.signal,
+              commitGuard: current.commitGuard,
+            });
+          }
           const validated = await this.rebindLiveRepository(existing, current);
           if (validated.repoRoot !== repository.repoRoot) {
             throw new Error(
@@ -430,10 +433,21 @@ export class ManagedWorktreeService {
     }
     if (existing && existing.removedAt === undefined) {
       if (await worktreePathExists(existing.path)) {
-        return await withWorktreeSource(params, async (current) => ({
-          record: await this.rebindLiveRepository(existing, current),
-          materialized: false,
-        }));
+        return await withWorktreeSource(params, async (current) => {
+          if (current.requireExactSource && current.checkoutCommit) {
+            await this.verifyCheckout({
+              path: existing.path,
+              repoRoot: repository.repoRoot,
+              checkoutCommit: current.checkoutCommit,
+              signal: current.signal,
+              commitGuard: current.commitGuard,
+            });
+          }
+          return {
+            record: await this.rebindLiveRepository(existing, current),
+            materialized: false,
+          };
+        });
       }
       await withWorktreeSource(params, () =>
         updateRegistryWorktree(this.env, existing.id, { removedAt: this.now() }),
@@ -446,6 +460,14 @@ export class ManagedWorktreeService {
         );
       }
       return await withWorktreeSource(params, async (current) => {
+        if (current.requireExactSource && current.checkoutCommit) {
+          await verifyWorktreeSnapshotSource(existing, {
+            repoRoot: repository.repoRoot,
+            checkoutCommit: current.checkoutCommit,
+            signal: current.signal,
+            commitGuard: current.commitGuard,
+          });
+        }
         const record = await this.restoreWithAllocation({
           id: existing.id,
           signal: current.signal,
@@ -453,6 +475,15 @@ export class ManagedWorktreeService {
           rollbackGuard: current.rollbackGuard,
         });
         publication.record = { ...record };
+        if (current.requireExactSource && current.checkoutCommit) {
+          await this.verifyCheckout({
+            path: record.path,
+            repoRoot: repository.repoRoot,
+            checkoutCommit: current.checkoutCommit,
+            signal: current.signal,
+            commitGuard: current.commitGuard,
+          });
+        }
         return { record, materialized: true };
       });
     }
@@ -460,11 +491,18 @@ export class ManagedWorktreeService {
     let publicationStarted = false;
     try {
       const materialized = await withWorktreeSource(params, async (current) => {
-        const created = await this.materializeRepositoryWorktree(
+        const created = await materializeRepositoryWorktree(
           current,
           repository,
           inferredName,
           suppliedName,
+          {
+            env: this.env,
+            now: this.now,
+            getConfig: this.getConfig,
+            requireSpace: (target, source, bytes) =>
+              this.requireAllocationSpace(target, source, bytes),
+          },
         );
         prepared = created;
         return created;
@@ -474,7 +512,16 @@ export class ManagedWorktreeService {
         repository,
         materialized,
       );
-      return await withWorktreeSource(params, (current) => {
+      return await withWorktreeSource(params, async (current) => {
+        if (current.requireExactSource && current.checkoutCommit) {
+          await this.verifyCheckout({
+            path: materialized.worktreePath,
+            repoRoot: repository.repoRoot,
+            checkoutCommit: current.checkoutCommit,
+            signal: current.signal,
+            commitGuard: current.commitGuard,
+          });
+        }
         current.signal?.throwIfAborted();
         current.commitGuard?.();
         this.requireAllocationSpace(materialized.worktreePath, repository);
@@ -513,158 +560,6 @@ export class ManagedWorktreeService {
       }
       throw error;
     }
-  }
-
-  private async materializeRepositoryWorktree(
-    params: CreateManagedWorktreeParams & WorktreeAllocationGuard,
-    repository: ResolvedRepository,
-    inferredName: string,
-    suppliedName: string | undefined,
-  ): Promise<MaterializedRepositoryWorktree> {
-    const root = path.join(await this.worktreesRoot(), repository.fingerprint);
-    const name =
-      suppliedName ??
-      (await generateName(
-        this.env,
-        repository.repoRoot,
-        repository.fingerprint,
-        root,
-        params,
-        params.suggestedName ?? inferredName,
-      ));
-    const worktreePath = path.join(root, name);
-    const branch = `openclaw/${name}`;
-    const branchExists = await runGit(repository.repoRoot, [
-      "show-ref",
-      "--quiet",
-      "--verify",
-      `refs/heads/${branch}`,
-    ]);
-    if (branchExists.code === 0) {
-      throw new Error(`branch already exists: ${branch}`);
-    }
-    if (branchExists.code !== 1) {
-      throw commandError("git show-ref --verify", branchExists);
-    }
-    // Default-base resolution fetches remote refs; it is an effect, not just discovery.
-    params.signal?.throwIfAborted();
-    params.commitGuard?.();
-    this.requireAllocationSpace(worktreePath, repository);
-    params.commitGuard?.();
-    if (params.checkoutCommit && !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(params.checkoutCommit)) {
-      throw new Error("Worktree checkout commit is invalid");
-    }
-    const base = params.checkoutCommit
-      ? {
-          commit: params.checkoutCommit,
-          gitOperand: params.checkoutCommit,
-          recordRef: params.baseRef ?? params.checkoutCommit,
-          remote: false,
-        }
-      : await resolveWorktreeBase(
-          repository.repoRoot,
-          params.baseRef,
-          params.signal,
-          params.commitGuard,
-        );
-    let gitBytes = 0;
-    const provisionedBytes =
-      params.provisionIgnoredFiles === false
-        ? 0
-        : (
-            await runGitWorkerOperation(
-              {
-                type: "worktree.provisioning-inspection",
-                input: { sourceRoot: repository.sourceRoot },
-              },
-              { signal: params.signal, assertCurrent: params.commitGuard },
-            )
-          ).estimatedBytes;
-    const setupStat =
-      params.runSetupScript === false
-        ? undefined
-        : await fs
-            .stat(path.join(repository.sourceRoot, ".openclaw", "worktree-setup.sh"))
-            .catch(() => undefined);
-    const runRepositorySetup = setupStat?.isFile() === true && (setupStat.mode & 0o111) !== 0;
-    const setupBytes = runRepositorySetup
-      ? Math.max(
-          WORKTREE_SETUP_HEADROOM_BYTES,
-          await directorySizeBytes(repository.sourceRoot, true, {
-            signal: params.signal,
-            assertCurrent: params.commitGuard,
-          }),
-        )
-      : 0;
-    params.signal?.throwIfAborted();
-    params.commitGuard?.();
-    let gitBase = params.profiles?.length ? base.commit : base.gitOperand;
-    let recordBase = base.recordRef;
-    const addCheckout = async () => {
-      // Resolve on every attempt, including the remote-base fallback to local HEAD.
-      // Never pair one commit's source selection with another commit's checkout.
-      const sourceProfile = params.profiles?.length
-        ? await resolveWorktreeSourceProfile(repository.repoRoot, gitBase, params.profiles, {
-            signal: params.signal,
-            commitGuard: () => params.commitGuard?.(),
-          })
-        : undefined;
-      params.signal?.throwIfAborted();
-      params.commitGuard?.();
-      await fs.mkdir(root, { recursive: true });
-      return await addManagedWorktree({
-        env: this.env,
-        now: this.now,
-        enabled: this.getConfig?.().worktreeAcceleration !== false,
-        repoRoot: repository.repoRoot,
-        commonDir: repository.commonDir,
-        worktreeRoot: path.dirname(root),
-        destination: worktreePath,
-        sourceOnly: params.provisionIgnoredFiles === false,
-        branch,
-        base: sourceProfile?.commit ?? gitBase,
-        sourceProfile,
-        prepareCommit: async (commit) => {
-          return (gitBytes = await estimateWorktreeGitBytes(repository.repoRoot, commit, {
-            signal: params.signal,
-            assertCurrent: params.commitGuard,
-          }));
-        },
-        requireSpace: (cloneBytes) =>
-          this.requireAllocationSpace(
-            worktreePath,
-            repository,
-            (cloneBytes ?? 2 * gitBytes) + 2 * provisionedBytes + setupBytes,
-          ),
-        signal: params.signal,
-        commitGuard: () => params.commitGuard?.(),
-        rollbackGuard: params.rollbackGuard,
-      });
-    };
-    let added = await addCheckout();
-    if (added.code !== 0 && base.remote) {
-      if (!(await canResetFailedWorktreeAdd(repository.repoRoot, worktreePath, branch, added))) {
-        throw commandError("git worktree add", added);
-      }
-      await resetFailedWorktreeAdd(repository.repoRoot, worktreePath, branch, params.rollbackGuard);
-      params.signal?.throwIfAborted();
-      params.commitGuard?.();
-      gitBase = "HEAD";
-      recordBase = "HEAD";
-      added = await addCheckout();
-    }
-    if (added.code !== 0) {
-      throw commandError("git worktree add", added);
-    }
-    return {
-      name,
-      worktreePath,
-      branch,
-      recordBase,
-      provisionedBytes,
-      setupBytes,
-      runRepositorySetup,
-    };
   }
 
   private async completeRepositoryWorktreeSetup(

@@ -22,6 +22,7 @@ import {
   assertCanMutateClaimedCard,
   cardBoardId,
   cardParentIds,
+  workboardDependsOn,
   cardSessionKey,
   isActiveDependencyTarget,
   isDependencyPromotableStatus,
@@ -38,6 +39,13 @@ import {
   sameWorkboardCardState,
 } from "./store-compensation.js";
 import { MAX_CARD_COMMENTS, MAX_CARD_WORKER_LOGS, POSITION_STEP } from "./store-constants.js";
+import {
+  assertExactSourceCreation,
+  assertExactSourceMutation,
+  assertExactSourceCompletionClaim,
+  type WorkboardExactSourceUpdateOptions,
+  type WorkboardVerifyCheckout,
+} from "./store-exact-source.js";
 import type {
   WorkboardBoardInput,
   WorkboardBoardSummary,
@@ -86,6 +94,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
   private lastNotificationSequence = 0;
   private compensationJournal?: WorkboardMutationJournalEntry[];
   protected readonly store: WorkboardCardStore;
+  protected readonly verifyCheckout?: WorkboardVerifyCheckout;
   protected readonly boardStore: WorkboardKeyedStore<PersistedWorkboardBoard>;
   protected readonly subscriptionStore: WorkboardSubscriptionStore;
   protected readonly attachmentStore: WorkboardKeyedStore<PersistedWorkboardAttachment>;
@@ -100,9 +109,11 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
       dataVersion?: () => number | Promise<number>;
       close?: () => void | Promise<void>;
       runWithWriteAuthority?: WorkboardWriteAuthority;
+      verifyCheckout?: WorkboardVerifyCheckout;
     },
   ) {
     super(stores.dataVersion, stores.close, stores.ready, stores.runWithWriteAuthority);
+    this.verifyCheckout = stores.verifyCheckout;
     this.store = this.trackCardStore(store);
     this.boardStore = this.track(stores.boards);
     this.subscriptionStore = {
@@ -544,6 +555,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
     const syncedMetadata = trimMetadataToBudget(
       syncExecutionAttemptMetadata(metadata, execution, now),
     );
+    assertExactSourceCreation({ status, execution, metadata: syncedMetadata });
     const boardId = syncedMetadata.automation?.boardId ?? "default";
     const position = Number.isFinite(normalizedPosition)
       ? normalizedPosition
@@ -671,7 +683,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
   protected async updateCard(
     id: string,
     patch: WorkboardCardPatch,
-    options: WorkboardUpdateCardOptions = {},
+    options: WorkboardUpdateCardOptions & WorkboardExactSourceUpdateOptions = {},
   ): Promise<WorkboardCard> {
     const existing = await this.requireCard(id);
     if (
@@ -807,6 +819,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
       ...(startedAt ? { startedAt } : {}),
       ...(completedAt ? { completedAt } : {}),
     });
+    assertExactSourceMutation(existing, next, options);
     next.metadata = trimMetadataToBudget(
       syncExecutionAttemptMetadata(next.metadata ?? {}, execution, now),
       options,
@@ -831,6 +844,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
     if (metadataIsEmpty(next.metadata)) {
       delete next.metadata;
     }
+    assertExactSourceCompletionClaim(existing, options);
     const expectedUpdatedAt = options.expectedUpdatedAt ?? existing.updatedAt;
     if (options.ownerSlot) {
       const result = await this.store.claimIfOwnerAvailable(
@@ -1022,7 +1036,7 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
     if (isActiveDependencyTarget(child, { allowStatusOnly: options.allowStatusOnlyActiveChild })) {
       throw new Error("active child cards cannot gain parent dependencies.");
     }
-    if (await this.dependsOn(parent.id, child.id)) {
+    if (workboardDependsOn(await this.list(), parent.id, child.id)) {
       throw new Error("dependency link would create a cycle.");
     }
     const parentLinks = parent.metadata?.links ?? [];
@@ -1086,23 +1100,6 @@ export class WorkboardCoreStore extends WorkboardStoreRuntime {
       return "scheduled";
     }
     return parentsDone ? "ready" : "todo";
-  }
-
-  private async dependsOn(cardId: string, targetParentId: string): Promise<boolean> {
-    const cards = new Map((await this.list()).map((entry) => [entry.id, entry]));
-    const seen = new Set<string>();
-    const visit = (id: string): boolean => {
-      if (id === targetParentId) {
-        return true;
-      }
-      if (seen.has(id)) {
-        return false;
-      }
-      seen.add(id);
-      const card = cards.get(id);
-      return Boolean(card && cardParentIds(card).some(visit));
-    };
-    return visit(cardId);
   }
 
   protected async recordOrchestrationCandidate(

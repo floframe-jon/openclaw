@@ -263,6 +263,7 @@ describe("plugin runtime command execution", () => {
         expectFunctionKeys(runtime.worktrees as Record<string, unknown>, [
           "resolveCheckoutRoot",
           "hasSelfContainedCheckoutMetadata",
+          "verifyCheckout",
           "create",
           "release",
           "removeIfLossless",
