@@ -12,7 +12,6 @@ import { resolveRuntimeWorkerUrl } from "openclaw/plugin-sdk/process-runtime";
 import { clearRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { managedWorktreeName } from "./dispatcher-workspace.js";
 import {
   dispatchAndStartWorkboardCards,
   type WorkboardSubagentRuntime,
@@ -64,7 +63,7 @@ describe("native dispatcher exact source binding", () => {
   let store: ReturnType<typeof createWorkboardSqliteTestStore>;
   const createdRecords = new Map<
     string,
-    Awaited<ReturnType<WorkboardWorktreeRuntime["create"]>> & { ownerId: string }
+    Awaited<ReturnType<WorkboardWorktreeRuntime["create"]>> & { ownerId: string; name: string }
   >();
   const preparationReleases: Array<() => Promise<void>> = [];
   let afterCreate: (() => Promise<void>) | undefined;
@@ -123,8 +122,15 @@ describe("native dispatcher exact source binding", () => {
           async create(input) {
             // Every allocation, reuse, restore, and preparation lease is the
             // public native runtime operation. Record facts, never fabricate a checkout.
+            if (!input.name) {
+              throw new Error("Expected explicitly named native test checkout");
+            }
             const created = await native.create(input);
-            createdRecords.set(created.id, { ...created, ownerId: input.ownerId });
+            createdRecords.set(created.id, {
+              ...created,
+              ownerId: input.ownerId,
+              name: input.name,
+            });
             if (created.releasePreparation) {
               preparationReleases.push(created.releasePreparation);
             }
@@ -282,7 +288,7 @@ describe("native dispatcher exact source binding", () => {
       if (snapshot) {
         const restored = await worktrees.create({
           repoRoot,
-          name: managedWorktreeName(card.id),
+          name: retained.name,
           ownerKind: "workboard",
           ownerId: card.id,
           checkoutCommit: a,
@@ -311,7 +317,7 @@ describe("native dispatcher exact source binding", () => {
     });
     const retained = await worktrees.create({
       repoRoot,
-      name: managedWorktreeName(card.id),
+      name: "retained-correct-a",
       ownerKind: "workboard",
       ownerId: card.id,
       checkoutCommit: a,
@@ -430,7 +436,7 @@ describe("native dispatcher exact source binding", () => {
     });
     await worktrees.create({
       repoRoot,
-      name: managedWorktreeName(first.id),
+      name: "retained-wrong-a",
       ownerKind: "workboard",
       ownerId: first.id,
       checkoutCommit: a,

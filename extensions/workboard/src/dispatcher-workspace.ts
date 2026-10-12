@@ -29,7 +29,7 @@ export type ResolveAgentWorkspaceRuntime = (
   modelId?: string,
 ) => WorkboardTargetWorkspaceRuntime | Promise<WorkboardTargetWorkspaceRuntime>;
 
-export function managedWorktreeName(cardId: string): string {
+function managedWorktreeName(cardId: string): string {
   const suffix = cardId
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
