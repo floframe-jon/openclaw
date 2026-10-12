@@ -28,8 +28,15 @@ import {
   MAX_CARD_ARTIFACTS,
   MAX_CARD_COMMENTS,
   MAX_CARD_NOTIFICATIONS,
+  MAX_CARD_PROOF,
   secondsToDurationMs,
 } from "./store-constants.js";
+import {
+  assertCurrentExecutionClaim,
+  assertExecutionAuthority,
+  verifyExecutionSource,
+  type WorkboardExecutionAuthority,
+} from "./store-exact-source.js";
 import type {
   WorkboardBlockInput,
   WorkboardCardPatch,
@@ -146,6 +153,9 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
             guarded.status === "backlog" || guarded.status === "todo" || guarded.status === "ready"
               ? "running"
               : guarded.status,
+          ...(guarded.execution?.source && guarded.execution.status !== "running"
+            ? { sessionKey: null, runId: null, execution: null }
+            : {}),
           ...(options.adoptWorkspaceAccess && !guarded.metadata?.automation?.workspaceAccess
             ? { workspaceAccess: options.adoptWorkspaceAccess }
             : {}),
@@ -241,6 +251,14 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
   ): Promise<WorkboardCard> {
     const existing = await this.requireCard(id);
     assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
+    const exactSource =
+      existing.execution?.source || existing.metadata?.automation?.workspace?.checkoutCommit;
+    if (exactSource) {
+      assertCurrentExecutionClaim(existing, scope === null ? undefined : scope);
+    }
+    const verifiedSource = exactSource
+      ? await verifyExecutionSource(existing, this.verifyCheckout)
+      : undefined;
     const now = Date.now();
     const createdCardIds = normalizeStringList(input.createdCardIds, "created card ids", 120);
     const childIds = cardChildIds(existing);
@@ -272,6 +290,37 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
           .slice(-MAX_CARD_ARTIFACTS)
       : [];
     const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
+    const completionProof = appendCompletionProof(metadata.proof, proof, proofId);
+    const completionProofId = proofId ?? proof?.id;
+    const selectedProof = completionProof.find((entry) => entry.id === completionProofId);
+    let reviewEvidence = metadata.automation?.reviewEvidence;
+    if (verifiedSource) {
+      const launch = metadata.automation?.launch;
+      if (!completionProofId || !selectedProof || selectedProof.status === "unknown") {
+        throw new Error("exact completion requires fresh proof with a known result.");
+      }
+      if (
+        !launch?.previousProofIds ||
+        launch.previousProofIds.includes(completionProofId) ||
+        reviewEvidence?.some((entry) => entry.proofId === completionProofId)
+      ) {
+        throw new Error("exact completion cannot reuse proof from an earlier attempt.");
+      }
+      const attemptId = existing.execution?.runId;
+      if (!attemptId) {
+        throw new Error("exact completion requires a current execution attempt.");
+      }
+      reviewEvidence = [
+        ...(reviewEvidence ?? []),
+        {
+          attemptId,
+          proofId: completionProofId,
+          source: verifiedSource,
+          status: selectedProof.status,
+          verifiedAt: now,
+        },
+      ].slice(-MAX_CARD_PROOF);
+    }
     const notification: WorkboardNotification = {
       id: randomUUID(),
       kind: "completed",
@@ -300,8 +349,10 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
               ...metadata.automation,
               summary,
               createdCardIds,
+              ...(reviewEvidence ? { reviewEvidence } : {}),
             },
             metadata.automation,
+            { allowLaunchState: Boolean(verifiedSource) },
           ),
           comments: summary
             ? [
@@ -309,7 +360,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
                 { id: randomUUID(), body: summary, createdAt: now },
               ].slice(-MAX_CARD_COMMENTS)
             : metadata.comments,
-          proof: appendCompletionProof(metadata.proof, proof, proofId),
+          proof: completionProof,
           artifacts: artifacts.length
             ? [...(metadata.artifacts ?? []), ...artifacts].slice(-MAX_CARD_ARTIFACTS)
             : metadata.artifacts,
@@ -320,6 +371,13 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
       },
       {
         enforceStatusHolds: true,
+        ...(verifiedSource
+          ? {
+              expectedUpdatedAt: existing.updatedAt,
+              verifiedSourceCompletion: verifiedSource,
+              allowAutomationLaunch: true,
+            }
+          : {}),
         preserveProofId: proofId ?? proof?.id,
       },
     );
@@ -372,16 +430,27 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     id: string,
     input: WorkboardBlockInput = {},
     scope: WorkboardMutationScope | null | undefined = input,
-    options: { clearExecutionAssociation?: boolean } = {},
+    options: {
+      clearExecutionAssociation?: boolean;
+      expectedAuthority?: WorkboardExecutionAuthority;
+    } = {},
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
       const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
+      if (options.expectedAuthority) {
+        assertCurrentExecutionClaim(existing, scope === null ? undefined : scope);
+        assertExecutionAuthority(existing, options.expectedAuthority);
+      }
       const now = Date.now();
       const reason =
         normalizeBoundedString(input.reason, undefined, 2000, "block reason") ??
         "Workboard card blocked.";
-      return await this.updateCard(id, this.buildBlockedCardPatch(existing, reason, now, options));
+      return await this.updateCard(
+        id,
+        this.buildBlockedCardPatch(existing, reason, now, options),
+        options.expectedAuthority ? { expectedUpdatedAt: existing.updatedAt } : {},
+      );
     });
   }
 

@@ -99,6 +99,14 @@ export type WorkboardDiagnosticKind = (typeof WORKBOARD_DIAGNOSTIC_KINDS)[number
 export type WorkboardDiagnosticSeverity = (typeof WORKBOARD_DIAGNOSTIC_SEVERITIES)[number];
 export type WorkboardNotificationKind = (typeof WORKBOARD_NOTIFICATION_KINDS)[number];
 
+export type WorkboardSourceBinding = {
+  path: string;
+  repoRoot: string;
+  commonDir: string;
+  repoFingerprint: string;
+  checkoutCommit: string;
+};
+
 export type WorkboardExecution = {
   id: string;
   kind: "agent-session";
@@ -108,8 +116,17 @@ export type WorkboardExecution = {
   model?: string;
   sessionKey?: string;
   runId?: string;
+  source?: WorkboardSourceBinding;
   startedAt: number;
   updatedAt: number;
+};
+
+export type WorkboardReviewEvidence = {
+  attemptId: string;
+  proofId: string;
+  source: WorkboardSourceBinding;
+  status: WorkboardProofStatus;
+  verifiedAt: number;
 };
 
 export type WorkboardEvent = {
@@ -248,6 +265,9 @@ export type WorkboardWorkspace = {
   branch?: string;
   sourcePath?: string;
   sourceBranch?: string;
+  /** Exact, clean review source; both fields are required together. Resume work omits them. */
+  repoRoot?: string;
+  checkoutCommit?: string;
 };
 
 export type WorkboardWorkspaceAccess =
@@ -258,6 +278,8 @@ type WorkboardLaunchIdentity = {
   requestedSessionKey: string;
   provisionalRunId: string;
   preparedAt: number;
+  source?: WorkboardSourceBinding;
+  previousProofIds?: string[];
 };
 
 export type WorkboardLaunchState =
@@ -290,6 +312,7 @@ export type WorkboardAutomation = {
   dispatchCount?: number;
   lastDispatchAt?: number;
   launch?: WorkboardLaunchState;
+  reviewEvidence?: WorkboardReviewEvidence[];
 };
 
 export type WorkboardBoardMetadata = {

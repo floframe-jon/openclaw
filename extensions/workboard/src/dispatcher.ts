@@ -1,8 +1,8 @@
-import path from "node:path";
 import type {
   WorkboardCard,
   WorkboardExecution,
   WorkboardLaunchState,
+  WorkboardSourceBinding,
   WorkboardWorkspace,
 } from "@openclaw/workboard-contract";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
@@ -11,18 +11,23 @@ import {
   resolveNonNegativeIntegerOption,
 } from "openclaw/plugin-sdk/number-runtime";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
-import { canonicalPathFromExistingAncestor } from "openclaw/plugin-sdk/security-runtime";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   assertRestrictedWorkboardTarget,
   cleanupWorkboardCardWorktree,
-  managedWorktreeName,
+  materializeWorkboardWorkspace,
   resolveDispatchWorkspaceAccess,
   type ResolveAgentWorkspaceRuntime,
 } from "./dispatcher-workspace.js";
 import { workboardSessionKeyForCard } from "./session-link.js";
 import { cardBoardId } from "./store-card-helpers.js";
 import { workboardCardConsumesOwnerSlot, workboardCardSlotOwner } from "./store-constants.js";
-import { WorkboardStore, type WorkboardDispatchResult } from "./store.js";
+import {
+  executionAuthority,
+  WorkboardStore,
+  type WorkboardDispatchResult,
+  type WorkboardExecutionAuthority,
+} from "./store.js";
 import {
   assertCanonicalWorkboardRootAccess,
   assertWorkboardWorkspaceSourceAccess,
@@ -62,6 +67,14 @@ type WorkboardStartFailure = {
   cardId: string;
   title: string;
   error: string;
+  source?: {
+    cardId: string;
+    attemptId?: string;
+    checkoutCommit: string;
+    repoRoot: string;
+    path?: string;
+    mismatch?: Record<string, unknown>;
+  };
 };
 
 type WorkboardDispatchAndStartResult = WorkboardDispatchResult & {
@@ -105,84 +118,9 @@ function buildExecution(params: {
       : {}),
     sessionKey: params.sessionKey,
     runId: params.runId,
+    ...(params.card.execution?.source ? { source: params.card.execution.source } : {}),
     startedAt: params.now,
     updatedAt: params.now,
-  };
-}
-
-async function materializeWorkspace(params: {
-  card: WorkboardCard;
-  worktrees?: WorkboardWorktreeRuntime;
-  materializeWorktree: boolean;
-  workspaceAccess: WorkboardWorkspaceAccess;
-  assertOwnerCurrent?: () => void;
-}): Promise<{ workspace?: WorkboardWorkspace; cwd?: string }> {
-  const workspace = params.card.metadata?.automation?.workspace;
-  if (!workspace || workspace.kind === "scratch") {
-    return {};
-  }
-  const sourcePath = workspace.sourcePath ?? workspace.path;
-  const sourceBranch = workspace.sourcePath ? workspace.sourceBranch : workspace.branch;
-  if (!sourcePath || !path.isAbsolute(sourcePath)) {
-    throw new Error("worktree workspace path must be an absolute git checkout path");
-  }
-  // Persisted cards can outlive the caller that created them. Keep the exact
-  // canonical path that passes this dispatcher's current boundary check.
-  const canonicalSourcePath = await assertWorkboardWorkspaceSourceAccess(
-    workspace,
-    params.workspaceAccess,
-  );
-  if (!canonicalSourcePath) {
-    throw new Error("worktree workspace path is required");
-  }
-  if (workspace.kind === "dir" || !params.workspaceAccess.unrestricted) {
-    await assertCanonicalWorkboardRootAccess(canonicalSourcePath, params.workspaceAccess);
-    return workspace.kind === "worktree"
-      ? { cwd: canonicalSourcePath, workspace: { kind: "dir", path: canonicalSourcePath } }
-      : { cwd: canonicalSourcePath };
-  }
-  if (!params.materializeWorktree) {
-    throw new Error("managed worktree materialization was not explicitly authorized");
-  }
-  if (!params.worktrees) {
-    throw new Error("managed worktree runtime is unavailable");
-  }
-  params.assertOwnerCurrent?.();
-  const worktree = await params.worktrees.create({
-    repoRoot: canonicalSourcePath,
-    name: managedWorktreeName(params.card.id),
-    ...(sourceBranch ? { baseRef: sourceBranch } : {}),
-    ownerKind: "workboard",
-    ownerId: params.card.id,
-    ...(params.assertOwnerCurrent ? { commitGuard: params.assertOwnerCurrent } : {}),
-  });
-  let cwd: string;
-  try {
-    cwd = await canonicalPathFromExistingAncestor(worktree.path);
-  } catch (error) {
-    const removed = await params.worktrees
-      .removeIfLossless({
-        path: worktree.path,
-        ownerKind: "workboard",
-        ownerId: params.card.id,
-      })
-      .catch(() => false);
-    if (!removed) {
-      throw new Error(`${formatErrorMessage(error)}; managed worktree cleanup failed`, {
-        cause: error,
-      });
-    }
-    throw error;
-  }
-  return {
-    cwd,
-    workspace: {
-      kind: "worktree",
-      path: worktree.path,
-      branch: worktree.branch,
-      sourcePath,
-      ...(sourceBranch ? { sourceBranch } : {}),
-    },
   };
 }
 
@@ -191,6 +129,8 @@ function buildWorkerPrompt(params: {
   context: string;
   ownerId: string;
   token: string;
+  source?: WorkboardSourceBinding;
+  runId?: string;
 }): string {
   return [
     `Work on this OpenClaw Workboard card: ${params.card.title}`,
@@ -204,6 +144,17 @@ function buildWorkerPrompt(params: {
     "When done, call workboard_complete with the card id, token, summary, and proof.",
     "If you recorded proof separately, pass its returned proofId to workboard_complete.",
     "If blocked, call workboard_block with the card id, token, and reason.",
+    ...(params.source
+      ? [
+          "",
+          "## Exact source review",
+          `Attempt: ${params.runId}`,
+          `Repository: ${params.source.repoRoot}`,
+          `Expected cwd: ${params.source.path}`,
+          `Expected immutable commit: ${params.source.checkoutCommit}`,
+          "Before reviewing, verify your actual cwd, Git repository, HEAD, and clean source agree with these values. Record the actual commit in your proof. On mismatch, block this attempt; do not reset, edit source, or accept PASS on another revision. Tracked changes and nonignored source files invalidate this review; repository-declared setup/cache outputs are allowed.",
+        ]
+      : []),
     "",
     params.context,
   ].join("\n");
@@ -359,6 +310,9 @@ async function runWorkboardDispatch(
     let runStarted = false;
     let workspaceMutation: { before: WorkboardCard; after: WorkboardCard } | undefined;
     let preparedLaunch: WorkboardPreparedLaunch | undefined;
+    let exactAuthority: WorkboardExecutionAuthority | undefined;
+    let preparationId: string | undefined;
+    let releasePreparation: (() => Promise<void>) | undefined;
     const requestedWorkspace = card.metadata?.automation?.workspace;
     let workspaceAccess: WorkboardWorkspaceAccess;
     let targetWorkspace: string | undefined;
@@ -438,43 +392,75 @@ async function runWorkboardDispatch(
         },
       );
       claimValue = claimed.token;
+      if (claimed.card.metadata?.automation?.workspace?.checkoutCommit) {
+        exactAuthority = executionAuthority(claimed.card);
+        preparationId = `${card.id}:preparation:${claimed.card.updatedAt}`;
+      }
       // Racing card changes never reached a worker and must not consume the
       // provider-outage budget or starve a later healthy candidate.
       attemptedStarts += 1;
       const context = await params.store.buildWorkerContext(card.id);
-      const materialized = await materializeWorkspace({
+      const materialized = await materializeWorkboardWorkspace({
         card: claimed.card,
         worktrees: params.worktrees,
         materializeWorktree: params.options?.materializeWorktree === true,
         workspaceAccess,
         assertOwnerCurrent,
       });
+      releasePreparation = materialized.releasePreparation;
       const runCwd = materialized.cwd ?? implicitWorkspaceCwd;
       if (runCwd && !workspaceAccess.unrestricted) {
         await assertRestrictedTarget(runCwd);
       }
       materializedWorkspace = materialized.workspace;
       if (materializedWorkspace) {
-        const workspaceBase = await params.store.get(card.id);
-        if (!workspaceBase) {
-          throw new Error(`card not found: ${card.id}`);
+        if (exactAuthority) {
+          workspaceMutation = await params.store.bindExecutionWorkspace(card.id, {
+            scope: { ownerId, token: claimValue },
+            expectedAuthority: exactAuthority,
+            workspace: materializedWorkspace,
+            workspaceAccess,
+            assertOwnerCurrent,
+          });
+          exactAuthority = executionAuthority(workspaceMutation.after);
+        } else {
+          const workspaceBase = await params.store.get(card.id);
+          if (!workspaceBase) {
+            throw new Error(`card not found: ${card.id}`);
+          }
+          const materializedCard = await params.store.update(
+            card.id,
+            { workspace: materializedWorkspace, workspaceAccess },
+            { expectedUpdatedAt: workspaceBase.updatedAt },
+          );
+          workspaceMutation = { before: workspaceBase, after: materializedCard };
         }
-        const materializedCard = await params.store.update(
-          card.id,
-          { workspace: materializedWorkspace, workspaceAccess },
-          { expectedUpdatedAt: workspaceBase.updatedAt },
-        );
-        workspaceMutation = { before: workspaceBase, after: materializedCard };
       }
       const prepared = await params.store.prepareExecutionLaunch(card.id, {
         requestedSessionKey: sessionKey,
         now,
         scope: { ownerId, token: claimValue },
         assertOwnerCurrent,
+        ...(exactAuthority
+          ? { expectedAuthority: exactAuthority, source: materialized.source }
+          : {}),
       });
       const launched = prepared.card;
       preparedLaunch = prepared.launch;
       const runId = prepared.launch.provisionalRunId;
+      if (materialized.source && params.worktrees?.verifyCheckout && exactAuthority) {
+        await params.worktrees.verifyCheckout({
+          path: materialized.source.path,
+          repoRoot: materialized.source.repoRoot,
+          checkoutCommit: materialized.source.checkoutCommit,
+          commitGuard: assertOwnerCurrent,
+        });
+        await params.store.assertExecutionLaunchCurrent(card.id, {
+          scope: { ownerId, token: claimValue },
+          expectedAuthority: exactAuthority,
+          expectedLaunch: prepared.launch,
+        });
+      }
       assertOwnerCurrent?.();
       const run = await params.subagent.run({
         sessionKey,
@@ -484,6 +470,8 @@ async function runWorkboardDispatch(
           context,
           ownerId,
           token: claimValue,
+          source: materialized.source,
+          runId,
         }),
         toolsAlsoAllow: [...WORKBOARD_REQUIRED_WORKER_TOOLS],
         ...(params.options?.provider ? { provider: params.options.provider } : {}),
@@ -546,29 +534,55 @@ async function runWorkboardDispatch(
         .catch(() => undefined);
     } catch (error) {
       const message = formatErrorMessage(error);
-      startFailures.push({ cardId: card.id, title: card.title, error: message });
+      startFailures.push({
+        cardId: card.id,
+        title: card.title,
+        error: message,
+        ...(requestedWorkspace?.checkoutCommit && requestedWorkspace.repoRoot
+          ? {
+              source: {
+                cardId: card.id,
+                attemptId: preparedLaunch?.provisionalRunId ?? preparationId,
+                checkoutCommit: requestedWorkspace.checkoutCommit,
+                repoRoot: requestedWorkspace.repoRoot,
+                path: materializedWorkspace?.path ?? requestedWorkspace.path,
+                ...(isRecord(error) && isRecord(error.details) ? { mismatch: error.details } : {}),
+              },
+            }
+          : {}),
+      });
       if (!claimValue || runStarted) {
         continue;
       }
       try {
+        if (exactAuthority) {
+          await params.store.checkExecutionSource(card.id, {
+            scope: { ownerId, token: claimValue },
+            expectedAuthority: exactAuthority,
+          });
+        }
         const reason = `Dispatcher could not start worker: ${message}`;
         if (preparedLaunch) {
           await params.store.failPreparedLaunch(card.id, {
             expectedLaunch: preparedLaunch,
             reason,
             failedAt: Date.now(),
+            ...(exactAuthority
+              ? { scope: { ownerId, token: claimValue }, expectedAuthority: exactAuthority }
+              : {}),
           });
         } else {
           await params.store.block(
             card.id,
             { ownerId, token: claimValue, reason },
             { ownerId, token: claimValue },
+            exactAuthority ? { expectedAuthority: exactAuthority } : {},
           );
         }
       } catch {
         // Leave the original start failure visible; dispatch will diagnose stale claims later.
       }
-      if (params.worktrees) {
+      if (params.worktrees && !requestedWorkspace?.checkoutCommit) {
         const failedCard = await params.store.get(card.id).catch(() => undefined);
         if (failedCard) {
           await cleanupWorkboardCardWorktree({
@@ -578,6 +592,23 @@ async function runWorkboardDispatch(
             ...(workspaceMutation ? { workspaceMutation } : {}),
           }).catch(() => undefined);
         }
+      }
+    } finally {
+      // Close only this dispatch preparation hold. Native worker holds remain owned.
+      try {
+        await releasePreparation?.();
+      } catch (error) {
+        // A cleanup error must not revoke an accepted worker or replace a start failure.
+        await params.store
+          .addWorkerLog(
+            card.id,
+            {
+              level: "warn",
+              message: `Preparation lease cleanup needs reconciliation: ${formatErrorMessage(error)}`,
+            },
+            { ownerId, token: claimValue },
+          )
+          .catch(() => undefined);
       }
     }
   }

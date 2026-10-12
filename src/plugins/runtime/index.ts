@@ -141,9 +141,29 @@ function createRuntimeWorktrees(): PluginRuntime["worktrees"] {
       const { hasSelfContainedGitMetadata } = await import("../../agents/worktrees/git.js");
       return await hasSelfContainedGitMetadata(params.path);
     },
+    async verifyCheckout(params) {
+      const { managedWorktrees } = await loadService();
+      return await managedWorktrees.verifyCheckout(params);
+    },
     async create(params) {
       const { managedWorktrees } = await loadService();
       const record = await managedWorktrees.create(params);
+      if (params.requireExactSource) {
+        const { acquireWorktreeRunLease } = await import("../../agents/worktrees/run-lease.js");
+        const lease = await acquireWorktreeRunLease(record.id);
+        try {
+          params.commitGuard?.();
+          return {
+            id: record.id,
+            path: record.path,
+            branch: record.branch,
+            releasePreparation: lease.release,
+          };
+        } catch (error) {
+          await lease.release();
+          throw error;
+        }
+      }
       await managedWorktrees.acquire(record.id);
       return { id: record.id, path: record.path, branch: record.branch };
     },

@@ -60,6 +60,8 @@ export type CreateManagedWorktreeParams = {
   profiles?: string[];
   /** Verified immutable checkout point when baseRef retains the publication target. */
   checkoutCommit?: string;
+  /** Enforce the immutable checkout and clean source on reuse, restore and after setup. */
+  requireExactSource?: boolean;
   ownerKind?: ManagedWorktreeOwnerKind;
   ownerId?: string;
   // Repository Git hooks are always disabled; only the setup script runs repo-local code.
@@ -78,7 +80,7 @@ export type CreateManagedWorktreeParams = {
 
 export type CreateEmptyManagedWorktreeParams = Omit<
   CreateManagedWorktreeParams,
-  "repoRoot" | "baseRef" | "checkoutCommit" | "profiles"
+  "repoRoot" | "baseRef" | "checkoutCommit" | "requireExactSource" | "profiles"
 > & {
   ownerKind: "session";
   ownerId: string;

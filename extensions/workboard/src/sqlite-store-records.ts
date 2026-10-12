@@ -435,6 +435,15 @@ export function readCard(db: DatabaseSync, row: Row, preloaded?: CardChildRows):
   const metadata = readMetadata(db, row, preloaded);
   const events = readEvents(db, card.id, preloaded);
   const execution = readExecution(row);
+  const launch = metadata?.automation?.launch;
+  if (
+    execution &&
+    launch?.source &&
+    (execution.runId === launch.provisionalRunId ||
+      (launch.phase === "accepted" && execution.runId === launch.acceptedRunId))
+  ) {
+    execution.source = launch.source;
+  }
   return definedFields({
     ...card,
     notes: stringValue(row, "notes"),

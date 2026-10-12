@@ -295,6 +295,7 @@ async function assertWorkspaceAllowed(
     return undefined;
   }
   const workspace = value as Record<string, unknown>;
+  await assertPathAllowed(workspace.repoRoot, access);
   if (options?.sourceOnly) {
     return await assertPathAllowed(workspace.sourcePath ?? workspace.path, access);
   }

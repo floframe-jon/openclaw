@@ -113,6 +113,17 @@ export function workspaceField() {
       kind: Type.String({ description: "scratch, dir, or worktree." }),
       path: Type.Optional(Type.String({ description: "Absolute dir/worktree path." })),
       branch: Type.Optional(Type.String({ description: "Suggested branch." })),
+      repoRoot: Type.Optional(
+        Type.String({
+          description: "Canonical repository for exact source review; requires checkoutCommit.",
+        }),
+      ),
+      checkoutCommit: Type.Optional(
+        Type.String({
+          description:
+            "Full immutable commit for clean exact source review; requires repoRoot. Omit for resumable builds.",
+        }),
+      ),
     }),
   );
 }

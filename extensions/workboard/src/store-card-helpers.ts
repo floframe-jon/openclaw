@@ -705,3 +705,24 @@ export function compareNotifications(a: WorkboardNotification, b: WorkboardNotif
   }
   return a.id.localeCompare(b.id);
 }
+
+export function workboardDependsOn(
+  entries: readonly WorkboardCard[],
+  cardId: string,
+  targetParentId: string,
+): boolean {
+  const cards = new Map(entries.map((entry) => [entry.id, entry]));
+  const seen = new Set<string>();
+  const visit = (id: string): boolean => {
+    if (id === targetParentId) {
+      return true;
+    }
+    if (seen.has(id)) {
+      return false;
+    }
+    seen.add(id);
+    const card = cards.get(id);
+    return Boolean(card && cardParentIds(card).some(visit));
+  };
+  return visit(cardId);
+}

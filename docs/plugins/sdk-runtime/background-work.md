@@ -142,6 +142,21 @@ Start agent work in the background: hook-dispatched turns for external content a
     launches or worktree writes, while accepted work retains its cleanup and
     completion responsibilities.
 
+    `worktrees.create({ ..., checkoutCommit, requireExactSource: true })` opts
+    into an immutable clean-source contract for fresh, reused, and restored
+    checkouts. A mismatch preserves the retained checkout or snapshot and
+    requires a separately owned isolated workspace. Without
+    `requireExactSource`, `checkoutCommit` remains a fresh-materialization hint
+    and resumable edits are preserved. Native runtimes also expose optional
+    `worktrees.verifyCheckout({ path, repoRoot, checkoutCommit })` for explicit
+    directories, prelaunch checks, and completion. It returns canonical
+    repository/path identity and actual HEAD only when source is clean; callers
+    requiring exactness must reject an unavailable verifier. Exact `create()` also
+    returns an owned `releasePreparation()` hold. Close it in `finally` after
+    launch or failure; the native run-lease API preserves other worker holds.
+    Source verification observes Git state at each boundary; isolated ownership
+    and completion rechecks protect the review through its lifecycle.
+
     `promptMode: "minimal"` selects the bounded subagent prompt instead of the full conversation prompt. The plugin runtime exposes only this mode; omission keeps the full prompt. Use `disableTools: true` as well when the run must have an exact empty tool surface.
 
     `completionDelivery: "current-requester"` is default-off and is only available while a `before_dispatch` hook is handling an authenticated inbound request. OpenClaw captures the canonical requester session and delivery route before invoking the plugin, then delivers the subagent completion through the normal announce path. Plugins cannot provide or override requester lineage or destination fields. Calls outside that requester-bound hook context are rejected.

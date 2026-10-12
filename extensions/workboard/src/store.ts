@@ -10,6 +10,7 @@ import type {
   WorkboardMetadata,
   WorkboardStaleState,
   WorkboardStatus,
+  WorkboardSourceBinding,
 } from "@openclaw/workboard-contract";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import {
@@ -33,6 +34,15 @@ import {
   MAX_CARD_NOTIFICATIONS,
   secondsToDurationMs,
 } from "./store-constants.js";
+import {
+  assertCurrentExecutionClaim,
+  assertExecutionAuthority,
+  assertExecutionSourceBinding,
+  preparedLaunchMatchesCard,
+  type WorkboardExecutionAuthority,
+  type WorkboardVerifyCheckout,
+} from "./store-exact-source.js";
+import { WorkboardExecutionStore } from "./store-execution.js";
 import type {
   WorkboardBulkInput,
   WorkboardCardPatch,
@@ -42,8 +52,9 @@ import type {
   WorkboardMutationScope,
 } from "./store-inputs.js";
 import { capText, normalizeBoardId, normalizeTimestamp } from "./store-normalizers.js";
-import { WorkboardNotificationStore } from "./store-notifications.js";
 import { readCards } from "./store-read.js";
+export { executionAuthority } from "./store-exact-source.js";
+export type { WorkboardExecutionAuthority, WorkboardVerifyCheckout } from "./store-exact-source.js";
 
 export type { WorkboardDispatchResult } from "./store-inputs.js";
 export { WorkboardCardConflictError } from "./store-core.js";
@@ -66,23 +77,6 @@ type WorkboardExecutionAssociationPatch = WorkboardCardPatch & {
   metadata?: WorkboardMetadata;
 };
 type WorkboardPreparedLaunch = Extract<WorkboardLaunchState, { phase: "prepared" }>;
-
-function preparedLaunchMatchesCard(
-  card: WorkboardCard,
-  expected: WorkboardPreparedLaunch,
-): boolean {
-  const launch = card.metadata?.automation?.launch;
-  return (
-    launch?.phase === "prepared" &&
-    launch.requestedSessionKey === expected.requestedSessionKey &&
-    launch.provisionalRunId === expected.provisionalRunId &&
-    launch.preparedAt === expected.preparedAt &&
-    card.sessionKey === expected.requestedSessionKey &&
-    card.runId === expected.provisionalRunId &&
-    card.execution?.sessionKey === expected.requestedSessionKey &&
-    card.execution?.runId === expected.provisionalRunId
-  );
-}
 
 function acceptedLaunchForAssociation(
   card: WorkboardCard,
@@ -162,7 +156,10 @@ function executionAssociationPatch(
   return {
     sessionKey: input.sessionKey,
     ...(input.runId ? { runId: input.runId } : {}),
-    execution: input.execution,
+    execution: {
+      ...input.execution,
+      ...(card.execution?.source ? { source: card.execution.source } : {}),
+    },
     ...(metadata ? { metadata } : {}),
   };
 }
@@ -182,6 +179,7 @@ function lifecycleExecution(params: {
     status: params.status ?? existing?.status ?? "running",
     ...(existing?.engine ? { engine: existing.engine } : {}),
     ...(existing?.model ? { model: existing.model } : {}),
+    ...(existing?.source ? { source: existing.source } : {}),
     sessionKey: params.association.sessionKey,
     ...(runId ? { runId } : {}),
     startedAt: existing?.startedAt ?? params.card.startedAt ?? params.card.updatedAt,
@@ -190,7 +188,7 @@ function lifecycleExecution(params: {
 }
 
 // Capability layers split review boundaries only; the core still owns persistence and mutation order.
-export class WorkboardStore extends WorkboardNotificationStore {
+export class WorkboardStore extends WorkboardExecutionStore {
   async prepareExecutionLaunch(
     id: string,
     input: {
@@ -198,6 +196,8 @@ export class WorkboardStore extends WorkboardNotificationStore {
       now: number;
       scope: WorkboardMutationScope;
       assertOwnerCurrent?: () => void;
+      expectedAuthority?: WorkboardExecutionAuthority;
+      source?: WorkboardSourceBinding;
     },
   ): Promise<{ card: WorkboardCard; launch: WorkboardPreparedLaunch }> {
     return await this.enqueueMutation(async () => {
@@ -205,12 +205,40 @@ export class WorkboardStore extends WorkboardNotificationStore {
         id,
         (card) => {
           assertCanMutateClaimedCard(card, input.scope);
+          if ((input.expectedAuthority || input.source) && card.status !== "running") {
+            throw new Error("card stopped before execution preparation.");
+          }
+          if (input.expectedAuthority) {
+            assertCurrentExecutionClaim(card, input.scope);
+            assertExecutionAuthority(card, input.expectedAuthority);
+          }
+          const existingLaunch = card.metadata?.automation?.launch;
+          if (
+            existingLaunch?.phase === "prepared" &&
+            card.execution?.status === "running" &&
+            preparedLaunchMatchesCard(card, existingLaunch)
+          ) {
+            throw new Error("card already has a prepared execution launch.");
+          }
+          if (card.metadata?.automation?.workspace?.checkoutCommit && !input.source) {
+            throw new Error("exact launch requires a verified source binding.");
+          }
+          if (input.source) {
+            assertCurrentExecutionClaim(card, input.scope);
+            assertExecutionSourceBinding(card, input.source);
+          }
           const provisionalRunId = `workboard:${card.id}:${card.updatedAt}`;
           const launch: WorkboardPreparedLaunch = {
             phase: "prepared",
             requestedSessionKey: input.requestedSessionKey,
             provisionalRunId,
             preparedAt: card.updatedAt,
+            ...(input.source
+              ? {
+                  source: input.source,
+                  previousProofIds: (card.metadata?.proof ?? []).map((proof) => proof.id),
+                }
+              : {}),
           };
           return {
             sessionKey: input.requestedSessionKey,
@@ -224,6 +252,7 @@ export class WorkboardStore extends WorkboardNotificationStore {
               runId: provisionalRunId,
               startedAt: input.now,
               updatedAt: input.now,
+              ...(input.source ? { source: input.source } : {}),
             },
             metadata: {
               ...card.metadata,
@@ -275,7 +304,13 @@ export class WorkboardStore extends WorkboardNotificationStore {
 
   async failPreparedLaunch(
     id: string,
-    input: { expectedLaunch: WorkboardPreparedLaunch; reason: string; failedAt: number },
+    input: {
+      expectedLaunch: WorkboardPreparedLaunch;
+      reason: string;
+      failedAt: number;
+      scope?: WorkboardMutationScope;
+      expectedAuthority?: WorkboardExecutionAuthority;
+    },
   ): Promise<boolean> {
     const failedAt = Math.max(input.failedAt, input.expectedLaunch.preparedAt);
     const reason = capText(input.reason, 2000) ?? "Dispatcher could not start worker.";
@@ -286,6 +321,13 @@ export class WorkboardStore extends WorkboardNotificationStore {
         (card) => {
           if (!preparedLaunchMatchesCard(card, input.expectedLaunch)) {
             return undefined;
+          }
+          if (input.expectedLaunch.source) {
+            assertCurrentExecutionClaim(card, input.scope);
+            if (!input.expectedAuthority) {
+              throw new Error("exact launch failure requires captured workspace authority.");
+            }
+            assertExecutionAuthority(card, input.expectedAuthority);
           }
           const blocked = this.buildBlockedCardPatch(card, reason, failedAt, {
             clearExecutionAssociation: true,
@@ -348,7 +390,11 @@ export class WorkboardStore extends WorkboardNotificationStore {
             input.sourceUpdatedAt !== undefined &&
             shouldSyncWorkboardLifecycleStatus(card, input.targetStatus)
           ) {
-            patch.status = input.targetStatus;
+            // Session success is transport evidence; only tokened native completion
+            // verifies the exact source and releases review dependencies.
+            if (!(card.execution?.source && input.targetStatus === "done")) {
+              patch.status = input.targetStatus;
+            }
             metadata = { lifecycleStatusSourceUpdatedAt: input.sourceUpdatedAt };
           }
           const acceptedLaunch = input.association
@@ -666,8 +712,11 @@ export class WorkboardStore extends WorkboardNotificationStore {
     );
   }
 
-  static openSqlite(workerModuleUrl: URL) {
+  static openSqlite(
+    workerModuleUrl: URL,
+    options: { verifyCheckout?: WorkboardVerifyCheckout } = {},
+  ) {
     const stores = createWorkboardSqliteStores({ workerModuleUrl });
-    return new WorkboardStore(stores.cards, stores);
+    return new WorkboardStore(stores.cards, { ...stores, ...options });
   }
 }
