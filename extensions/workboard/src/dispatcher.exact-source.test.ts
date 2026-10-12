@@ -13,12 +13,27 @@ import { clearRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-s
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { managedWorktreeName } from "./dispatcher-workspace.js";
-import { dispatchAndStartWorkboardCards, type WorkboardWorktreeRuntime } from "./dispatcher.js";
+import {
+  dispatchAndStartWorkboardCards,
+  type WorkboardSubagentRuntime,
+  type WorkboardWorktreeRuntime,
+} from "./dispatcher.js";
 import { workboardSqliteBackendEntrypoint } from "./sqlite-backend-entrypoint.test-support.js";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import { createWorkboardSqliteTestStore } from "./test/sqlite-store.js";
 
 const execFileAsync = promisify(execFile);
+type SubagentRun = WorkboardSubagentRuntime["run"];
+type SubagentRunMock = ReturnType<typeof vi.fn<SubagentRun>>;
+
+function requireRunCall(run: SubagentRunMock, index = 0): Parameters<SubagentRun>[0] {
+  const call = run.mock.calls[index];
+  if (!call) {
+    throw new Error(`Expected native dispatcher worker call ${index}`);
+  }
+  return call[0];
+}
+
 async function git(cwd: string, ...args: string[]) {
   return (await execFileAsync("git", ["-C", cwd, ...args])).stdout.trim();
 }
@@ -53,6 +68,16 @@ describe("native dispatcher exact source binding", () => {
   >();
   const preparationReleases: Array<() => Promise<void>> = [];
   let afterCreate: (() => Promise<void>) | undefined;
+
+  function requireCreatedRecord(ownerId?: string) {
+    const record = [...createdRecords.values()].find(
+      (candidate) => ownerId === undefined || candidate.ownerId === ownerId,
+    );
+    if (!record) {
+      throw new Error("Expected native worktree creation record");
+    }
+    return record;
+  }
 
   beforeAll(async () => {
     template = templates.make("openclaw-dispatch-source-template-");
@@ -130,7 +155,7 @@ describe("native dispatcher exact source binding", () => {
     checkoutCommit,
     branch: "main",
   });
-  const dispatch = (run: ReturnType<typeof vi.fn>, options = {}) =>
+  const dispatch = (run: SubagentRunMock, options = {}) =>
     dispatchAndStartWorkboardCards({
       store,
       worktrees,
@@ -151,7 +176,10 @@ describe("native dispatcher exact source binding", () => {
       workspace: workspace(b),
       workspaceAccess: { unrestricted: true },
     });
-    const run = vi.fn(async ({ cwd }: { cwd: string }) => {
+    const run = vi.fn<SubagentRun>(async ({ cwd }) => {
+      if (!cwd) {
+        throw new Error("Expected native dispatcher checkout cwd");
+      }
       expect(await git(cwd, "rev-parse", "HEAD")).toBe(b);
       expect(await fs.readFile(path.join(cwd, "README.md"), "utf8")).toBe("candidate B\n");
       return { runId: "review-b" };
@@ -160,7 +188,7 @@ describe("native dispatcher exact source binding", () => {
     const actual = (await store.get(card.id))!;
     expect(actual.execution?.source).toMatchObject({
       checkoutCommit: b,
-      path: run.mock.calls[0][0].cwd,
+      path: requireRunCall(run).cwd,
       repoRoot,
     });
     expect(actual.metadata?.automation?.launch).toMatchObject({
@@ -186,14 +214,14 @@ describe("native dispatcher exact source binding", () => {
         workspace: workspace(a),
         workspaceAccess: { unrestricted: true },
       });
-      const initialRun = vi.fn().mockResolvedValue({ runId: "review-a" });
+      const initialRun = vi.fn<SubagentRun>().mockResolvedValue({ runId: "review-a" });
       expect((await dispatch(initialRun)).started).toHaveLength(1);
       const initial = (await store.get(card.id))!;
       await store.complete(card.id, {
         token: initial.metadata?.claim?.token,
         proof: { status: "passed", note: a },
       });
-      const retained = [...createdRecords.values()].find((record) => record.ownerId === card.id)!;
+      const retained = requireCreatedRecord(card.id);
       if (snapshot) {
         expect(
           await worktrees.removeIfLossless({
@@ -204,7 +232,7 @@ describe("native dispatcher exact source binding", () => {
         ).toBe(true);
       }
       await store.update(card.id, { status: "ready", workspace: workspace(b) });
-      const run = vi.fn().mockResolvedValue({ runId: "recovery-b" });
+      const run = vi.fn<SubagentRun>().mockResolvedValue({ runId: "recovery-b" });
       const rejected = await dispatch(run);
       expect(rejected.started).toEqual([]);
       expect(rejected.startFailures).toEqual([
@@ -240,7 +268,7 @@ describe("native dispatcher exact source binding", () => {
       const recovered = await dispatch(run);
       expect(recovered.started).toHaveLength(1);
       expect(run).toHaveBeenCalledOnce();
-      expect(run.mock.calls[0][0].cwd).toBe(isolated.path);
+      expect(requireRunCall(run).cwd).toBe(isolated.path);
       const current = (await store.get(card.id))!;
       await expect(
         store.complete(card.id, {
@@ -289,11 +317,11 @@ describe("native dispatcher exact source binding", () => {
       checkoutCommit: a,
       requireExactSource: true,
     });
-    const run = vi.fn().mockResolvedValue({ runId: "same-a" });
+    const run = vi.fn<SubagentRun>().mockResolvedValue({ runId: "same-a" });
     const results = await Promise.all([dispatch(run), dispatch(run)]);
     expect(results.flatMap((result) => result.started)).toHaveLength(1);
     expect(run).toHaveBeenCalledOnce();
-    expect(run.mock.calls[0][0].cwd).toBe(retained.path);
+    expect(requireRunCall(run).cwd).toBe(retained.path);
   });
 
   it("rejects candidate mutation during materialization without overwriting the new binding", async () => {
@@ -306,12 +334,12 @@ describe("native dispatcher exact source binding", () => {
     afterCreate = async () => {
       await store.update(card.id, { workspace: workspace(b) });
     };
-    const run = vi.fn();
+    const run = vi.fn<SubagentRun>();
     const result = await dispatch(run);
     expect(result.started).toEqual([]);
     expect(run).not.toHaveBeenCalled();
     expect((await store.get(card.id))?.metadata?.automation?.workspace?.checkoutCommit).toBe(b);
-    expect(await git([...createdRecords.values()][0].path, "rev-parse", "HEAD")).toBe(a);
+    expect(await git(requireCreatedRecord().path, "rev-parse", "HEAD")).toBe(a);
   });
 
   it("claim expiry during materialization prevents launch and preserves source", async () => {
@@ -327,10 +355,10 @@ describe("native dispatcher exact source binding", () => {
         metadata: { claim: { ...current.metadata?.claim, expiresAt: Date.now() - 1 } },
       });
     };
-    const run = vi.fn();
+    const run = vi.fn<SubagentRun>();
     expect((await dispatch(run)).started).toEqual([]);
     expect(run).not.toHaveBeenCalled();
-    expect(await git([...createdRecords.values()][0].path, "rev-parse", "HEAD")).toBe(a);
+    expect(await git(requireCreatedRecord().path, "rev-parse", "HEAD")).toBe(a);
   });
 
   it("failed worker launch preserves the exact checkout and supports native retry", async () => {
@@ -342,11 +370,11 @@ describe("native dispatcher exact source binding", () => {
       workspaceAccess: { unrestricted: true },
     });
     const run = vi
-      .fn()
+      .fn<SubagentRun>()
       .mockRejectedValueOnce(new Error("worker cancelled before start"))
       .mockResolvedValue({ runId: "retry-b" });
     expect((await dispatch(run)).started).toEqual([]);
-    const preserved = [...createdRecords.values()][0];
+    const preserved = requireCreatedRecord();
     expect(await git(preserved.path, "rev-parse", "HEAD")).toBe(b);
     const registrations = await git(repoRoot, "worktree", "list", "--porcelain");
     const registeredCheckout = registrations
@@ -357,7 +385,7 @@ describe("native dispatcher exact source binding", () => {
     await store.unblock(card.id);
     await store.promote(card.id);
     expect((await dispatch(run)).started).toHaveLength(1);
-    expect(run.mock.calls[1][0].cwd).toBe(preserved.path);
+    expect(requireRunCall(run, 1).cwd).toBe(preserved.path);
   });
 
   it.each(["dir", "worktree"] as const)(
@@ -371,7 +399,7 @@ describe("native dispatcher exact source binding", () => {
         workspaceAccess: access,
       });
       const create = vi.spyOn(worktrees, "create");
-      const run = vi.fn().mockResolvedValue({ runId: "restricted-b" });
+      const run = vi.fn<SubagentRun>().mockResolvedValue({ runId: "restricted-b" });
       const options = {
         resolveAgentWorkspaceRuntime: () => ({ sandboxed: true, workspaceAccess: access }),
       };
@@ -386,7 +414,7 @@ describe("native dispatcher exact source binding", () => {
       await store.unblock(card.id);
       await store.promote(card.id);
       expect((await dispatch(run, options)).started).toHaveLength(1);
-      expect(run.mock.calls[0][0].cwd).toBe(repoRoot);
+      expect(requireRunCall(run).cwd).toBe(repoRoot);
       expect(create).not.toHaveBeenCalled();
     },
   );
@@ -415,7 +443,7 @@ describe("native dispatcher exact source binding", () => {
       workspace: workspace(b),
       workspaceAccess: { unrestricted: true },
     });
-    const run = vi.fn().mockResolvedValue({ runId: "healthy-b" });
+    const run = vi.fn<SubagentRun>().mockResolvedValue({ runId: "healthy-b" });
     const result = await dispatch(run);
     expect(result.startFailures.map((failure) => failure.cardId)).toEqual([first.id]);
     expect(result.started.map((started) => started.cardId)).toEqual([healthy.id]);

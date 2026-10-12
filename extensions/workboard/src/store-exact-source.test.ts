@@ -63,7 +63,7 @@ describe("exact Workboard execution fences", () => {
     for (const [name, commit] of [
       ["checkout-a", commitA],
       ["checkout-b", commitB],
-    ]) {
+    ] as const) {
       const checkoutPath = path.join(repoRoot, name);
       git(repoRoot, "worktree", "add", "--detach", checkoutPath, commit);
     }
@@ -196,7 +196,7 @@ describe("exact Workboard execution fences", () => {
 
   it("rejects a stale A token after native reclaim and B rebinding", async () => {
     const first = await attempt();
-    await store.reclaim(first.card.id, { token: first.token });
+    await store.reclaim(first.card.id, {}, { token: first.token });
     await store.update(first.card.id, { workspace: workspace(b) });
     const claimed = await store.claim(first.card.id, { ownerId: `worker:${first.card.id}` });
     const next = await store.prepareExecutionLaunch(first.card.id, {
@@ -321,7 +321,7 @@ describe("exact Workboard execution fences", () => {
     await expect(host.update(prepared.card.id, { workspace: workspace(b) })).rejects.toThrow(
       "authority changed",
     );
-    await store.reclaim(prepared.card.id, { token: prepared.token, status: "ready" });
+    await store.reclaim(prepared.card.id, { status: "ready" }, { token: prepared.token });
     await store.update(prepared.card.id, { workspace: workspace(b) });
     const claimed = await store.claim(prepared.card.id, { ownerId: `worker:${prepared.card.id}` });
     expect(claimed.card.execution).toBeUndefined();
@@ -458,11 +458,14 @@ describe("exact Workboard execution fences", () => {
       await expect(resumed.update(card.id, { status: "done" })).rejects.toThrow(
         "verified workboard_complete",
       );
-      await resumed.reclaim(card.id, {
-        token: claimedA.token,
-        status: "ready",
-        reason: "Fixture preparation reconciled after restart",
-      });
+      await resumed.reclaim(
+        card.id,
+        {
+          status: "ready",
+          reason: "Fixture preparation reconciled after restart",
+        },
+        { token: claimedA.token },
+      );
       await resumed.update(card.id, { workspace: workspace(b) });
       const claimedB = await resumed.claim(card.id, { ownerId: `restart-worker:${card.id}` });
       const bound = await resumed.bindExecutionWorkspace(card.id, {
