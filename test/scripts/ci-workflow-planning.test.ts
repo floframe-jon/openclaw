@@ -3322,13 +3322,13 @@ describe("ci workflow guards", () => {
 
   it.each([
     { repository: "openclaw/openclaw", ref: "refs/heads/main", expected: true },
-    { repository: "openclaw/openclaw", ref: "refs/heads/feature", expected: false },
+    { repository: "openclaw/openclaw", ref: "refs/heads/maintenance/2026.9.9", expected: false },
     { repository: "fork/openclaw", ref: "refs/heads/main", expected: false },
   ])(
     "gates only canonical main pushes admitted by CI ($repository $ref)",
     ({ repository, ref, expected }) => {
       const push = readCiWorkflow().on.push;
-      expect(push.branches).toEqual(["main"]);
+      expect(push.branches).toEqual(["main", "maintenance/2026.9.9"]);
       expect(push).not.toHaveProperty("paths");
       expect(push["paths-ignore"]).toEqual(["**/*.md", "docs/**"]);
       const result = runCiManifestFixture({
